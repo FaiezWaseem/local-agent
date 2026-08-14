@@ -5,7 +5,15 @@ import {transformWithOxc} from 'vite';
 
 const sourcePath = new URL('../src/content.ts', import.meta.url);
 let source = fs.readFileSync(sourcePath, 'utf8').replace(/void init\(\);\s*$/, '');
-source += '\n;globalThis.__parser = {parseStreamedToolCall, parseCompletionToolCall, completionPrompt, bridgeToolsEnabled};';
+source += `
+;globalThis.__parser = {
+  parseStreamedToolCall,
+  parseCompletionToolCall,
+  completionPrompt,
+  bridgeToolsEnabled,
+  reserveSubmissionCooldown,
+  resetSubmissionCooldown() { nextAllowedSubmissionAt = 0; }
+};`;
 
 const {code} = await transformWithOxc(source, 'content.ts', {
   lang: 'ts',
@@ -86,5 +94,15 @@ const continuationPrompt = context.__parser.completionPrompt(
 assert.match(continuationPrompt, /\[ASSISTANT_TOOL_CALLS\]/);
 assert.match(continuationPrompt, /\[TOOL tool_call_id=call_previous\]/);
 assert.match(continuationPrompt, /README\.md/);
+
+context.__parser.resetSubmissionCooldown();
+const firstSubmission = context.__parser.reserveSubmissionCooldown(8_000, 1_000);
+const queuedApiSubmission = context.__parser.reserveSubmissionCooldown(8_000, 1_100);
+const queuedToolSubmission = context.__parser.reserveSubmissionCooldown(8_000, 1_200);
+assert.equal(firstSubmission, 9_000);
+assert.equal(queuedApiSubmission, 17_000);
+assert.equal(queuedToolSubmission, 25_000);
+assert.equal(queuedApiSubmission - firstSubmission, 8_000);
+assert.equal(queuedToolSubmission - queuedApiSubmission, 8_000);
 
 console.log('tool parser and OpenAI prompt regressions: PASS');

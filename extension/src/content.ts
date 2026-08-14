@@ -192,7 +192,9 @@ RESULT AND COMPLETION CONTRACT
 - If a result reports failure, correct the arguments and retry when appropriate. Do not switch to a ${provider}-native tool.
 - Only when the task requires no local tool, or when all required local work is complete, respond normally with a concise answer.`;
 }
-const DEFAULT_RESULT_DELAY_MS = 5000;
+const DEFAULT_SUBMISSION_DELAY_MS = 8000;
+const MIN_SUBMISSION_DELAY_MS = 5000;
+const MAX_SUBMISSION_DELAY_MS = 30000;
 const LOCAL_TOOL_NAMES = new Set([
   'read_file',
   'write_file',
@@ -2017,9 +2019,18 @@ async function handleBridgeCompletionRequest(message: BridgeServerMessage) {
   sendCompletionBridgeMessage({type: 'completion.accepted', request_id: requestId});
 
   try {
-    await updateStatus('sending', `Submitting API completion ${requestId} to ${chatProviderName()}.`);
     const prompt = completionPrompt(messages, tools, toolChoice);
     if (!prompt.trim()) throw new Error('The completion request does not contain any supported text content.');
+    const delayMs = await configuredSubmissionDelayMs();
+    if (!await waitForSubmissionCooldown(
+      'API request',
+      delayMs,
+      () => activeBridgeCompletion?.id === requestId
+    )) {
+      if (activeBridgeCompletion?.id !== requestId) return;
+      throw new Error('Local agent stopped during the API submission cooldown.');
+    }
+    await updateStatus('sending', `Submitting API completion ${requestId} to ${chatProviderName()}.`);
     await submitBridgePrompt(prompt);
     await waitForBridgeStream(requestId);
   } catch (error) {
@@ -2309,30 +2320,43 @@ function installProtocolReinforcement() {
   }, true);
 }
 
-async function configuredResultDelayMs() {
+async function configuredSubmissionDelayMs() {
   const {resultDelayMs} = await chrome.storage.local.get('resultDelayMs');
   const parsed = Number(resultDelayMs);
-  if (!Number.isFinite(parsed)) return DEFAULT_RESULT_DELAY_MS;
-  return Math.min(30000, Math.max(3000, parsed));
+  if (!Number.isFinite(parsed)) return DEFAULT_SUBMISSION_DELAY_MS;
+  return Math.min(MAX_SUBMISSION_DELAY_MS, Math.max(MIN_SUBMISSION_DELAY_MS, parsed));
+}
+
+function reserveSubmissionCooldown(delayMs: number, now = Date.now()) {
+  const scheduledAt = Math.max(now + delayMs, nextAllowedSubmissionAt);
+  nextAllowedSubmissionAt = scheduledAt + delayMs;
+  return scheduledAt;
+}
+
+async function waitForSubmissionCooldown(label: string, delayMs: number, isCurrent = () => true) {
+  const generation = agentRunGeneration;
+  const stillRunning = () => agentRunning && generation === agentRunGeneration;
+  const scheduledAt = reserveSubmissionCooldown(delayMs);
+
+  while (scheduledAt > Date.now()) {
+    if (!stillRunning() || !isCurrent()) return false;
+    const remainingMs = scheduledAt - Date.now();
+    const seconds = Math.max(1, Math.ceil(remainingMs / 1000));
+    await updateStatus(
+      'cooldown',
+      `${label} ready. Sending to ${chatProviderName()} in ${seconds} second${seconds === 1 ? '' : 's'}.`
+    );
+    await new Promise(resolve => setTimeout(resolve, Math.min(1000, remainingMs)));
+  }
+
+  return stillRunning() && isCurrent();
 }
 
 async function submitResult(delayMs: number) {
   if (!agentRunning) return false;
   const generation = agentRunGeneration;
   const stillRunning = () => agentRunning && generation === agentRunGeneration;
-  const scheduledAt = Math.max(Date.now() + delayMs, nextAllowedSubmissionAt);
-  nextAllowedSubmissionAt = scheduledAt + delayMs;
-
-  while (scheduledAt > Date.now()) {
-    if (!stillRunning()) return false;
-    const remainingMs = scheduledAt - Date.now();
-    const seconds = Math.max(1, Math.ceil(remainingMs / 1000));
-    await updateStatus(
-      'cooldown',
-      `Tool result ready. Sending automatically in ${seconds} second${seconds === 1 ? '' : 's'}.`
-    );
-    await new Promise(resolve => setTimeout(resolve, Math.min(1000, remainingMs)));
-  }
+  if (!await waitForSubmissionCooldown('Tool result', delayMs)) return false;
 
   if (!stillRunning()) return false;
   await waitForProviderResponse(generation);
@@ -2381,7 +2405,7 @@ async function feed(result: unknown) {
   }
 
   setComposer(composer, text);
-  const delayMs = await configuredResultDelayMs();
+  const delayMs = await configuredSubmissionDelayMs();
   if (!await submitResult(delayMs)) {
     throw new Error(`Could not auto-submit the tool result. ${chatProviderName()} UI selectors may need updating.`);
   }

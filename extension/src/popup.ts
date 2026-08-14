@@ -24,7 +24,8 @@ const CHAT_PROVIDERS: Record<string, string> = {
   'chat.qwen.ai': 'Qwen',
   'chat.z.ai': 'Z.ai'
 };
-const DEFAULT_RESULT_DELAY_MS = 5000;
+const DEFAULT_SUBMISSION_DELAY_MS = 8000;
+const SUBMISSION_DELAY_OPTIONS = new Set([5000, 8000, 12000, 20000, 30000]);
 const EMPTY_POLICY: ApprovalPolicy = {edits: false, deletes: false, shell: false};
 const INITIAL_PROMPT = [
   'Never invoke native or built-in provider tools. The only permitted tools are read_file, write_file, edit_file, delete_file, list_directory, run_command, git_status, git_diff, and git_log.',
@@ -170,9 +171,11 @@ async function loadStoredValues() {
   connectedWorkspace = values.connectedWorkspace || '';
   approvalSettings = settingsFrom(values.approvalSettings);
   const storedDelay = Number(values.resultDelayMs);
-  resultDelayEl.value = String(Number.isFinite(storedDelay) && storedDelay >= 3000
+  const submissionDelayMs = SUBMISSION_DELAY_OPTIONS.has(storedDelay)
     ? storedDelay
-    : DEFAULT_RESULT_DELAY_MS);
+    : DEFAULT_SUBMISSION_DELAY_MS;
+  resultDelayEl.value = String(submissionDelayMs);
+  if (storedDelay !== submissionDelayMs) await chrome.storage.local.set({resultDelayMs: submissionDelayMs});
 
   setConnected(Boolean(connectedWorkspace));
   renderApprovalSettings();
@@ -366,9 +369,9 @@ approveShellEl.addEventListener('change', () => {
 });
 
 resultDelayEl.addEventListener('change', async () => {
-  const resultDelayMs = Number(resultDelayEl.value) || DEFAULT_RESULT_DELAY_MS;
+  const resultDelayMs = Number(resultDelayEl.value) || DEFAULT_SUBMISSION_DELAY_MS;
   await chrome.storage.local.set({resultDelayMs});
-  setStatus(`Automatic tool results will wait ${resultDelayMs / 1000} seconds.`, 'success');
+  setStatus(`API prompts and automatic tool replies will wait ${resultDelayMs / 1000} seconds.`, 'success');
 });
 
 copyPromptEl.addEventListener('click', async () => {

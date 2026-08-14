@@ -3,7 +3,7 @@
 Experimental Chrome extension + localhost Node daemon that gives DeepSeek, Qwen, and Z.ai **approved** local coding tools.
 
 ## Features
-- Automatic `<tool_call>` detection with a configurable 3-12 second result cooldown
+- Automatic `<tool_call>` detection with a shared 5-30 second provider cooldown for API prompts and tool replies
 - Message-occurrence-aware detection so identical tool calls can run again without replaying historical DOM copies
 - Background `run_command` execution with live elapsed-time polling and resume after tab refresh
 - Unique `tool_call_id` correlation across requests, delayed results, failures, and SQLite history
