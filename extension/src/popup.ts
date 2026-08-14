@@ -111,6 +111,7 @@ function formatAgentStatus(agentStatus?: AgentStatus) {
 function statusTone(agentStatus?: AgentStatus): StatusTone {
   if (agentStatus?.state === 'error') return 'error';
   if (['detected', 'approval', 'executing', 'cooldown', 'sending'].includes(agentStatus?.state || '')) return 'busy';
+  if (agentStatus?.state === 'stopped') return 'neutral';
   if (agentStatus) return 'success';
   return 'neutral';
 }
