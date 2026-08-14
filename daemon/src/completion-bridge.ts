@@ -20,6 +20,7 @@ type EventSubscriber = {
 };
 
 type CompletionBody = z.infer<typeof completionBodySchema>;
+type OpenAiToolCall = z.infer<typeof toolCallSchema>;
 
 type PendingCompletion = {
   id: string;
@@ -46,7 +47,8 @@ type BridgeMessage = {
   url?: string;
   sequence?: number;
   delta?: string;
-  content?: string;
+  content?: string | null;
+  tool_calls?: OpenAiToolCall[];
   finish_reason?: string;
   error?: string;
 };
@@ -57,18 +59,51 @@ class BridgeError extends Error {
   }
 }
 
+const toolCallSchema = z.object({
+  id: z.string().min(1),
+  type: z.literal('function'),
+  function: z.object({
+    name: z.string().min(1),
+    arguments: z.string()
+  }).passthrough()
+}).passthrough();
+
 const messageSchema = z.object({
   role: z.string().min(1),
   content: z.union([
     z.string(),
     z.array(z.object({type: z.string(), text: z.string().optional()}).passthrough())
-  ])
+  ]).nullable().optional(),
+  name: z.string().optional(),
+  tool_call_id: z.string().optional(),
+  tool_calls: z.array(toolCallSchema).optional()
 }).passthrough();
+
+const functionToolSchema = z.object({
+  type: z.literal('function'),
+  function: z.object({
+    name: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/),
+    description: z.string().optional(),
+    parameters: z.record(z.string(), z.unknown()).optional(),
+    strict: z.boolean().optional()
+  }).passthrough()
+}).passthrough();
+
+const toolChoiceSchema = z.union([
+  z.enum(['none', 'auto', 'required']),
+  z.object({
+    type: z.literal('function'),
+    function: z.object({name: z.string().min(1)}).passthrough()
+  }).passthrough()
+]);
 
 const completionBodySchema = z.object({
   model: z.string().min(1).default('deepseek-web'),
   messages: z.array(messageSchema).min(1),
-  stream: z.boolean().optional().default(false)
+  stream: z.boolean().optional().default(false),
+  tools: z.array(functionToolSchema).max(128).optional().default([]),
+  tool_choice: toolChoiceSchema.optional().default('auto'),
+  parallel_tool_calls: z.boolean().optional().default(false)
 }).passthrough();
 
 const BRIDGE_PROTOCOL = 'local-ai-agent';
@@ -124,7 +159,15 @@ function completionChunk(pending: PendingCompletion, delta: Record<string, unkno
   };
 }
 
-function completionResponse(pending: PendingCompletion, content: string, finishReason: string) {
+function completionResponse(
+  pending: PendingCompletion,
+  content: string,
+  finishReason: string,
+  toolCalls: OpenAiToolCall[]
+) {
+  const message = toolCalls.length
+    ? {role: 'assistant', content: null, tool_calls: toolCalls}
+    : {role: 'assistant', content};
   return {
     id: pending.id,
     object: 'chat.completion',
@@ -132,7 +175,7 @@ function completionResponse(pending: PendingCompletion, content: string, finishR
     model: pending.model,
     choices: [{
       index: 0,
-      message: {role: 'assistant', content},
+      message,
       finish_reason: finishReason
     }],
     usage: {prompt_tokens: 0, completion_tokens: 0, total_tokens: 0}
@@ -188,12 +231,21 @@ export function installCompletionBridge(app: FastifyInstance, token: string) {
     }
   };
 
-  const finish = (item: PendingCompletion, finalContent: string, finishReason: string) => {
+  const finish = (
+    item: PendingCompletion,
+    finalContent: string | null,
+    finishReason: string,
+    toolCalls: OpenAiToolCall[] = []
+  ) => {
     if (item.settled) return;
     const content = finalContent || item.content;
 
     if (item.stream && item.response && !item.response.destroyed) {
-      if (content.startsWith(item.content) && content.length > item.content.length) {
+      if (toolCalls.length) {
+        writeSse(item.response, completionChunk(item, {
+          tool_calls: toolCalls.map((call, index) => ({index, ...call}))
+        }, null));
+      } else if (content.startsWith(item.content) && content.length > item.content.length) {
         const remainder = content.slice(item.content.length);
         item.content = content;
         writeSse(item.response, completionChunk(item, {content: remainder}, null));
@@ -202,7 +254,7 @@ export function installCompletionBridge(app: FastifyInstance, token: string) {
       item.response.write('data: [DONE]\n\n');
       item.response.end();
     } else {
-      item.resolve?.(completionResponse(item, content, finishReason));
+      item.resolve?.(completionResponse(item, content, finishReason, toolCalls));
     }
 
     if (!release(item)) return;
@@ -211,6 +263,7 @@ export function installCompletionBridge(app: FastifyInstance, token: string) {
       provider: item.provider,
       model: item.model,
       finish_reason: finishReason,
+      tool_call_count: toolCalls.length,
       content_length: content.length
     });
   };
@@ -290,7 +343,14 @@ export function installCompletionBridge(app: FastifyInstance, token: string) {
     }
 
     if (message.type === 'completion.completed') {
-      finish(item, typeof message.content === 'string' ? message.content : '', message.finish_reason || 'stop');
+      const parsedToolCalls = z.array(toolCallSchema).safeParse(message.tool_calls || []);
+      if (!parsedToolCalls.success) {
+        fail(item, new BridgeError('Extension returned invalid OpenAI tool calls.', 502, 'invalid_tool_calls'));
+        return;
+      }
+      const toolCalls = parsedToolCalls.data;
+      const finishReason = toolCalls.length ? 'tool_calls' : message.finish_reason || 'stop';
+      finish(item, typeof message.content === 'string' ? message.content : null, finishReason, toolCalls);
       return;
     }
 
@@ -396,7 +456,10 @@ export function installCompletionBridge(app: FastifyInstance, token: string) {
         request_id: id,
         model: body.model,
         messages: body.messages,
-        stream: body.stream
+        stream: body.stream,
+        tools: body.tools,
+        tool_choice: body.tool_choice,
+        parallel_tool_calls: body.parallel_tool_calls
       });
     } catch (error) {
       fail(item, error instanceof BridgeError ? error : new BridgeError((error as Error).message));
@@ -450,6 +513,22 @@ export function installCompletionBridge(app: FastifyInstance, token: string) {
       return reply.code(400).send(openAiError(
         `Unsupported model ${parsed.data.model}. Use deepseek-web, glm-web, or auto.`,
         'model_not_found'
+      ));
+    }
+
+    const forcedTool = typeof parsed.data.tool_choice === 'object'
+      ? parsed.data.tool_choice.function.name
+      : undefined;
+    if (forcedTool && !parsed.data.tools.some(tool => tool.function.name === forcedTool)) {
+      return reply.code(400).send(openAiError(
+        `tool_choice references unavailable function ${forcedTool}.`,
+        'invalid_tool_choice'
+      ));
+    }
+    if (parsed.data.tool_choice === 'required' && parsed.data.tools.length === 0) {
+      return reply.code(400).send(openAiError(
+        'tool_choice is required, but no tools were provided.',
+        'invalid_tool_choice'
       ));
     }
 

@@ -2,13 +2,21 @@
 
 ## Status
 
-Open
+Completed
+
+## Resolution
+
+- Added validation and bridge forwarding for function `tools`, `tool_choice`, `parallel_tool_calls`, assistant `tool_calls`, and `role: "tool"` messages.
+- Added a schema-aware provider prompt that requires literal local envelopes instead of provider-native tools.
+- Added non-streaming `message.tool_calls` and streaming `delta.tool_calls` normalization with stable call IDs and `finish_reason: "tool_calls"`.
+- Added safe handling for required, forced, automatic, and disabled tool choices.
+- Added integration coverage for tool-result continuation and browser regression coverage for arbitrary client function names.
 
 ## Summary
 
-Text completions work through `/v1/chat/completions`, but OpenAI-compatible tool calling does not. Requests from OpenCode can include tool definitions, yet DeepSeek responds with normal prose instead of returning `message.tool_calls` or emitting a local `<tool_call>` for the extension.
+Text completions worked through `/v1/chat/completions`, but OpenAI-compatible tool calling did not. Requests from OpenCode could include tool definitions, yet DeepSeek responded with normal prose instead of returning `message.tool_calls` or emitting a local `<tool_call>` for the extension.
 
-## Current behavior
+## Original behavior
 
 - The completion request schema allows unknown fields, but the bridge forwards only `model`, `messages`, and `stream` to the extension.
 - `tools` and `tool_choice` are not represented in the extension bridge request.
@@ -72,4 +80,3 @@ The request also contains OpenCode's system instructions and available tool cont
 - Multiple calls in a conversation retain stable, unique `tool_call_id` values.
 - Tool-result messages can be sent back through `/v1/chat/completions` and DeepSeek continues the original task.
 - Integration tests cover `tools`, forced and automatic `tool_choice`, streamed tool-call arguments, and tool-result continuation.
-

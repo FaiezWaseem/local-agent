@@ -81,6 +81,8 @@ curl -N http://127.0.0.1:43121/v1/chat/completions \
 
 The daemon sends each request over an authenticated localhost WebSocket to an idle matching provider tab. The extension submits the conversation through the provider UI and returns normalized OpenAI `chat.completion.chunk` events followed by `data: [DONE]`. Only DeepSeek and Z.ai currently expose direct response streams; Qwen remains available for local tools but is not advertised by `/v1/models`.
 
+OpenAI function tools are supported through `tools` and `tool_choice` (`auto`, `none`, `required`, or a forced function). A provider tool envelope is normalized to `message.tool_calls` for regular responses or `delta.tool_calls` for streams, with `finish_reason: "tool_calls"`. Send the assistant call and its result back in the next request using `role: "tool"` and the returned `tool_call_id`. The browser bridge emits at most one function call per completion; clients can continue calling tools over successive requests.
+
 Real-time diagnostic events are available with the same bearer token:
 
 ```bash

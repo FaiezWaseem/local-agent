@@ -13,6 +13,19 @@ const daemonExecutable = process.env.DAEMON_EXECUTABLE
   ? path.resolve(workspace, process.env.DAEMON_EXECUTABLE)
   : process.execPath;
 const daemonArguments = process.env.DAEMON_EXECUTABLE ? [] : ['dist/server.js'];
+const listDirectoryTool = {
+  type: 'function',
+  function: {
+    name: 'list_directory',
+    description: 'List files and directories at a project-relative path.',
+    parameters: {
+      type: 'object',
+      properties: {path: {type: 'string'}},
+      required: ['path'],
+      additionalProperties: false
+    }
+  }
+};
 
 async function availablePort() {
   const server = net.createServer();
@@ -110,11 +123,58 @@ try {
   }));
   await waitForMessage(socket, 'bridge.ready');
 
+  let emittedToolCall = 0;
   socket.on('message', raw => {
     const message = JSON.parse(raw.toString());
     if (message.type !== 'completion.request') return;
     socket.send(JSON.stringify({type: 'completion.accepted', request_id: message.request_id}));
     if (message.messages.some(item => item.content === 'Hold this request')) return;
+    const finalMessage = message.messages.at(-1);
+    if (finalMessage?.role === 'tool') {
+      assert.equal(finalMessage.tool_call_id, 'call_previous');
+      assert.equal(message.messages.at(-2).tool_calls[0].function.name, 'list_directory');
+      socket.send(JSON.stringify({
+        type: 'completion.completed',
+        request_id: message.request_id,
+        content: 'The project contains README.md.',
+        finish_reason: 'stop'
+      }));
+      return;
+    }
+    if (message.tools?.length) {
+      assert.deepEqual(message.tools, [listDirectoryTool]);
+      const prompt = finalMessage?.content;
+      if (prompt === 'Do not use tools') {
+        assert.equal(message.tool_choice, 'none');
+        socket.send(JSON.stringify({
+          type: 'completion.completed',
+          request_id: message.request_id,
+          content: 'No tool used.',
+          finish_reason: 'stop'
+        }));
+        return;
+      }
+      if (prompt === 'Force the directory tool') {
+        assert.deepEqual(message.tool_choice, {type: 'function', function: {name: 'list_directory'}});
+      } else if (prompt === 'Require a tool') {
+        assert.equal(message.tool_choice, 'required');
+      } else {
+        assert.equal(message.tool_choice, 'auto');
+      }
+      emittedToolCall += 1;
+      socket.send(JSON.stringify({
+        type: 'completion.completed',
+        request_id: message.request_id,
+        content: null,
+        tool_calls: [{
+          id: `call_bridge_test_${emittedToolCall}`,
+          type: 'function',
+          function: {name: 'list_directory', arguments: '{"path":"."}'}
+        }],
+        finish_reason: 'tool_calls'
+      }));
+      return;
+    }
     socket.send(JSON.stringify({type: 'completion.delta', request_id: message.request_id, sequence: 0, delta: 'Hello'}));
     socket.send(JSON.stringify({type: 'completion.delta', request_id: message.request_id, sequence: 1, delta: ' world'}));
     socket.send(JSON.stringify({
@@ -156,6 +216,135 @@ try {
   assert.match(streamBody, /"content":"Hello"/);
   assert.match(streamBody, /"content":" world"/);
   assert.match(streamBody, /data: \[DONE\]/);
+
+  const automaticToolResponse = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {'content-type': 'application/json', authorization: `Bearer ${token}`},
+    body: JSON.stringify({
+      model: 'deepseek-web',
+      messages: [{role: 'user', content: 'Review the project files'}],
+      tools: [listDirectoryTool],
+      tool_choice: 'auto'
+    })
+  });
+  assert.equal(automaticToolResponse.status, 200);
+  const automaticToolCompletion = await automaticToolResponse.json();
+  assert.equal(automaticToolCompletion.choices[0].finish_reason, 'tool_calls');
+  assert.equal(automaticToolCompletion.choices[0].message.content, null);
+  assert.equal(automaticToolCompletion.choices[0].message.tool_calls[0].id, 'call_bridge_test_1');
+  assert.equal(automaticToolCompletion.choices[0].message.tool_calls[0].function.name, 'list_directory');
+  assert.equal(automaticToolCompletion.choices[0].message.tool_calls[0].function.arguments, '{"path":"."}');
+
+  const forcedToolResponse = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {'content-type': 'application/json', authorization: `Bearer ${token}`},
+    body: JSON.stringify({
+      model: 'deepseek-web',
+      messages: [{role: 'user', content: 'Force the directory tool'}],
+      tools: [listDirectoryTool],
+      tool_choice: {type: 'function', function: {name: 'list_directory'}}
+    })
+  });
+  assert.equal(forcedToolResponse.status, 200);
+  const forcedToolCompletion = await forcedToolResponse.json();
+  assert.equal(forcedToolCompletion.choices[0].message.tool_calls[0].id, 'call_bridge_test_2');
+  assert.notEqual(
+    forcedToolCompletion.choices[0].message.tool_calls[0].id,
+    automaticToolCompletion.choices[0].message.tool_calls[0].id
+  );
+
+  const requiredToolResponse = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {'content-type': 'application/json', authorization: `Bearer ${token}`},
+    body: JSON.stringify({
+      model: 'deepseek-web',
+      messages: [{role: 'user', content: 'Require a tool'}],
+      tools: [listDirectoryTool],
+      tool_choice: 'required'
+    })
+  });
+  assert.equal(requiredToolResponse.status, 200);
+  assert.equal((await requiredToolResponse.json()).choices[0].finish_reason, 'tool_calls');
+
+  const disabledToolResponse = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {'content-type': 'application/json', authorization: `Bearer ${token}`},
+    body: JSON.stringify({
+      model: 'deepseek-web',
+      messages: [{role: 'user', content: 'Do not use tools'}],
+      tools: [listDirectoryTool],
+      tool_choice: 'none'
+    })
+  });
+  assert.equal(disabledToolResponse.status, 200);
+  const disabledToolCompletion = await disabledToolResponse.json();
+  assert.equal(disabledToolCompletion.choices[0].finish_reason, 'stop');
+  assert.equal(disabledToolCompletion.choices[0].message.content, 'No tool used.');
+
+  const streamingToolResponse = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {'content-type': 'application/json', authorization: `Bearer ${token}`},
+    body: JSON.stringify({
+      model: 'deepseek-web',
+      stream: true,
+      messages: [{role: 'user', content: 'Stream a tool'}],
+      tools: [listDirectoryTool]
+    })
+  });
+  assert.equal(streamingToolResponse.status, 200);
+  const streamingToolBody = await streamingToolResponse.text();
+  assert.match(streamingToolBody, /"tool_calls":\[\{"index":0,"id":"call_bridge_test_4"/);
+  assert.match(streamingToolBody, /"arguments":"\{\\"path\\":\\"\.\\"\}"/);
+  assert.match(streamingToolBody, /"finish_reason":"tool_calls"/);
+  assert.doesNotMatch(streamingToolBody, /<tool_call>/);
+
+  const continuationResponse = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {'content-type': 'application/json', authorization: `Bearer ${token}`},
+    body: JSON.stringify({
+      model: 'deepseek-web',
+      messages: [
+        {role: 'user', content: 'Review the project'},
+        {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{
+            id: 'call_previous',
+            type: 'function',
+            function: {name: 'list_directory', arguments: '{"path":"."}'}
+          }]
+        },
+        {role: 'tool', tool_call_id: 'call_previous', content: '{"files":["README.md"]}'}
+      ],
+      tools: [listDirectoryTool]
+    })
+  });
+  assert.equal(continuationResponse.status, 200);
+  const continuationCompletion = await continuationResponse.json();
+  assert.equal(continuationCompletion.choices[0].message.content, 'The project contains README.md.');
+
+  const requiredWithoutTools = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {'content-type': 'application/json', authorization: `Bearer ${token}`},
+    body: JSON.stringify({
+      model: 'deepseek-web',
+      messages: [{role: 'user', content: 'Require a tool'}],
+      tool_choice: 'required'
+    })
+  });
+  assert.equal(requiredWithoutTools.status, 400);
+
+  const unknownForcedTool = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {'content-type': 'application/json', authorization: `Bearer ${token}`},
+    body: JSON.stringify({
+      model: 'deepseek-web',
+      messages: [{role: 'user', content: 'Force an unknown tool'}],
+      tools: [listDirectoryTool],
+      tool_choice: {type: 'function', function: {name: 'missing_tool'}}
+    })
+  });
+  assert.equal(unknownForcedTool.status, 400);
 
   if (!process.env.DAEMON_EXECUTABLE) {
     const cancellation = waitForMessage(socket, 'completion.cancel');

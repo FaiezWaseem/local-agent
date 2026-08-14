@@ -80,7 +80,34 @@ type PendingShellJob = {
 
 type BridgeChatMessage = {
   role: string;
-  content: string | Array<{type?: string; text?: string}>;
+  content?: string | Array<{type?: string; text?: string}> | null;
+  name?: string;
+  tool_call_id?: string;
+  tool_calls?: BridgeToolCall[];
+};
+
+type BridgeFunctionTool = {
+  type: 'function';
+  function: {
+    name: string;
+    description?: string;
+    parameters?: Record<string, unknown>;
+    strict?: boolean;
+  };
+};
+
+type BridgeToolCall = {
+  id: string;
+  type: 'function';
+  function: {
+    name: string;
+    arguments: string;
+  };
+};
+
+type BridgeToolChoice = 'none' | 'auto' | 'required' | {
+  type: 'function';
+  function: {name: string};
 };
 
 type BridgeServerMessage = {
@@ -88,6 +115,9 @@ type BridgeServerMessage = {
   request_id?: string;
   model?: string;
   messages?: BridgeChatMessage[];
+  tools?: BridgeFunctionTool[];
+  tool_choice?: BridgeToolChoice;
+  parallel_tool_calls?: boolean;
   provider?: string;
   error?: string;
 };
@@ -99,6 +129,9 @@ type ActiveBridgeCompletion = {
   content: string;
   finalAnswer: string;
   streamStarted: boolean;
+  tools: BridgeFunctionTool[];
+  toolChoice: BridgeToolChoice;
+  bufferProviderDeltas: boolean;
 };
 
 const TOOL_BLOCK_OPEN = '<tool_call>';
@@ -1253,6 +1286,7 @@ function installProviderStreamBridge() {
     const delta = (event as CustomEvent<unknown>).detail;
     if (!activeBridgeCompletion?.streamStarted || typeof delta !== 'string' || !delta) return;
     activeBridgeCompletion.content += delta;
+    if (activeBridgeCompletion.bufferProviderDeltas) return;
     activeBridgeCompletion.sequence += 1;
     sendCompletionBridgeMessage({
       type: 'completion.delta',
@@ -1823,22 +1857,84 @@ function closeCompletionBridge() {
 
 function bridgeMessageText(message: BridgeChatMessage) {
   if (typeof message.content === 'string') return message.content;
+  if (!Array.isArray(message.content)) return '';
   return message.content
     .filter(part => part.type === 'text' && typeof part.text === 'string')
     .map(part => part.text)
     .join('\n');
 }
 
-function completionPrompt(messages: BridgeChatMessage[]) {
+function bridgeMessageBody(message: BridgeChatMessage) {
+  const parts: string[] = [];
+  const content = bridgeMessageText(message);
+  if (content) parts.push(content);
+  if (message.tool_calls?.length) {
+    parts.push(`[ASSISTANT_TOOL_CALLS]\n${JSON.stringify(message.tool_calls)}`);
+  }
+  return parts.join('\n\n');
+}
+
+function forcedBridgeToolName(toolChoice: BridgeToolChoice) {
+  return typeof toolChoice === 'object' ? toolChoice.function.name : undefined;
+}
+
+function bridgeToolsEnabled(tools: BridgeFunctionTool[], toolChoice: BridgeToolChoice) {
+  return tools.length > 0 && toolChoice !== 'none';
+}
+
+function completionToolProtocol(tools: BridgeFunctionTool[], toolChoice: BridgeToolChoice) {
+  if (!tools.length) return '';
+  if (toolChoice === 'none') {
+    return `[OPENAI_FUNCTION_TOOL_PROTOCOL_V1]\nDo not call any function for this reply. Respond with normal assistant text.`;
+  }
+
+  const forcedTool = forcedBridgeToolName(toolChoice);
+  const choiceInstruction = forcedTool
+    ? `You MUST call the function named ${JSON.stringify(forcedTool)}.`
+    : toolChoice === 'required'
+      ? 'You MUST call one available function.'
+      : 'Call one available function whenever the task requires external action or information. Otherwise answer normally.';
+  const definitions = tools.map(tool => tool.function);
+
+  return `[OPENAI_FUNCTION_TOOL_PROTOCOL_V1]
+MANDATORY FUNCTION CONTROL FOR THIS REPLY
+- Never invoke provider-native tools or merely describe a function action.
+- The available functions below belong to the API client. To call one, emit literal assistant text for the bridge to convert.
+- ${choiceInstruction}
+- A function call response must contain exactly one envelope and no other text, Markdown, or explanation.
+- Use exactly: <tool_call>{"name":"FUNCTION_NAME","arguments":{}}</tool_call>
+- Emit strict JSON. The arguments value must be an object matching the selected function's parameters.
+- After emitting one call, stop and wait for the next API request containing its result.
+- Never invent function results.
+
+AVAILABLE FUNCTIONS
+${JSON.stringify(definitions)}`;
+}
+
+function completionPrompt(
+  messages: BridgeChatMessage[],
+  tools: BridgeFunctionTool[],
+  toolChoice: BridgeToolChoice
+) {
   const normalized = messages
-    .map(message => ({role: message.role.toUpperCase(), content: bridgeMessageText(message)}))
+    .map(message => ({
+      role: message.role.toUpperCase(),
+      toolCallId: message.tool_call_id,
+      content: bridgeMessageBody(message)
+    }))
     .filter(message => message.content.trim());
-  if (normalized.length === 1 && normalized[0].role === 'USER') return normalized[0].content;
+  const protocol = completionToolProtocol(tools, toolChoice);
+  if (!protocol && normalized.length === 1 && normalized[0].role === 'USER') return normalized[0].content;
 
   return [
     'Continue the conversation below and answer the final user message. Treat SYSTEM and DEVELOPER entries as instructions.',
     '',
-    ...normalized.flatMap(message => [`[${message.role}]`, message.content, ''])
+    ...normalized.flatMap(message => [
+      `[${message.role}${message.toolCallId ? ` tool_call_id=${message.toolCallId}` : ''}]`,
+      message.content,
+      ''
+    ]),
+    protocol
   ].join('\n').trimEnd();
 }
 
@@ -1893,6 +1989,8 @@ async function waitForBridgeStream(requestId: string) {
 async function handleBridgeCompletionRequest(message: BridgeServerMessage) {
   const requestId = String(message.request_id || '');
   const messages = Array.isArray(message.messages) ? message.messages : [];
+  const tools = Array.isArray(message.tools) ? message.tools : [];
+  const toolChoice = message.tool_choice || 'auto';
   if (!requestId || !messages.length) return;
 
   if (!agentRunning || activeBridgeCompletion || activeTool || providerResponseIsGenerating()
@@ -1911,13 +2009,16 @@ async function handleBridgeCompletionRequest(message: BridgeServerMessage) {
     sequence: -1,
     content: '',
     finalAnswer: '',
-    streamStarted: false
+    streamStarted: false,
+    tools,
+    toolChoice,
+    bufferProviderDeltas: bridgeToolsEnabled(tools, toolChoice)
   };
   sendCompletionBridgeMessage({type: 'completion.accepted', request_id: requestId});
 
   try {
     await updateStatus('sending', `Submitting API completion ${requestId} to ${chatProviderName()}.`);
-    const prompt = completionPrompt(messages);
+    const prompt = completionPrompt(messages, tools, toolChoice);
     if (!prompt.trim()) throw new Error('The completion request does not contain any supported text content.');
     await submitBridgePrompt(prompt);
     await waitForBridgeStream(requestId);
@@ -1931,6 +2032,33 @@ async function handleBridgeCompletionRequest(message: BridgeServerMessage) {
     });
     await updateStatus('error', `API completion ${requestId} failed: ${(error as Error).message}`);
   }
+}
+
+function parseCompletionToolCall(answer: string) {
+  const enveloped = parseStreamedToolCall(answer);
+  if (enveloped) return enveloped;
+
+  try {
+    const parsed = JSON.parse(stripCodeFence(answer)) as Partial<ToolCall>;
+    if (!parsed || typeof parsed !== 'object' || typeof parsed.name !== 'string') return null;
+    return {
+      name: parsed.name,
+      arguments: ensureArgumentsObject(parsed.arguments)
+    } satisfies ToolCall;
+  } catch {
+    return null;
+  }
+}
+
+function bridgeToolIsRequired(toolChoice: BridgeToolChoice) {
+  return toolChoice === 'required' || typeof toolChoice === 'object';
+}
+
+async function failBridgeCompletion(completion: ActiveBridgeCompletion, error: string) {
+  if (activeBridgeCompletion?.id !== completion.id) return;
+  activeBridgeCompletion = null;
+  sendCompletionBridgeMessage({type: 'completion.error', request_id: completion.id, error});
+  if (agentRunning) await updateStatus('error', `API completion ${completion.id} failed: ${error}`);
 }
 
 async function suppressCompletedBridgeResponse() {
@@ -1956,10 +2084,50 @@ async function finishBridgeCompletion() {
   const completion = activeBridgeCompletion;
   if (!completion) return;
   const content = completion.finalAnswer || completion.content;
-  const toolCall = parseStreamedToolCall(content);
+  const toolCall = parseCompletionToolCall(content);
   if (toolCall) streamedDomSuppressions.add(toolCallIdentity(toolCall));
   await suppressCompletedBridgeResponse();
   if (activeBridgeCompletion?.id !== completion.id) return;
+
+  if (toolCall && bridgeToolsEnabled(completion.tools, completion.toolChoice)) {
+    const allowed = completion.tools.find(tool => tool.function.name === toolCall.name);
+    const forcedTool = forcedBridgeToolName(completion.toolChoice);
+    if (!allowed) {
+      await failBridgeCompletion(completion, `Provider selected unavailable function ${toolCall.name}.`);
+      return;
+    }
+    if (forcedTool && forcedTool !== toolCall.name) {
+      await failBridgeCompletion(completion, `Provider selected ${toolCall.name}, but tool_choice requires ${forcedTool}.`);
+      return;
+    }
+
+    const openAiToolCall: BridgeToolCall = {
+      id: createToolCallId(),
+      type: 'function',
+      function: {
+        name: toolCall.name,
+        arguments: JSON.stringify(toolCall.arguments)
+      }
+    };
+    activeBridgeCompletion = null;
+    sendCompletionBridgeMessage({
+      type: 'completion.completed',
+      request_id: completion.id,
+      content: null,
+      tool_calls: [openAiToolCall],
+      finish_reason: 'tool_calls'
+    });
+    if (agentRunning) {
+      await updateStatus('waiting', `API completion ${completion.id} requested ${toolCall.name}. Waiting for the API client.`);
+    }
+    return;
+  }
+
+  if (bridgeToolIsRequired(completion.toolChoice)) {
+    await failBridgeCompletion(completion, 'Provider did not return the required function call.');
+    return;
+  }
+
   activeBridgeCompletion = null;
   sendCompletionBridgeMessage({
     type: 'completion.completed',

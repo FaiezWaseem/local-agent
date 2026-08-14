@@ -5,7 +5,7 @@ import {transformWithOxc} from 'vite';
 
 const sourcePath = new URL('../src/content.ts', import.meta.url);
 let source = fs.readFileSync(sourcePath, 'utf8').replace(/void init\(\);\s*$/, '');
-source += '\n;globalThis.__parser = {parseStreamedToolCall};';
+source += '\n;globalThis.__parser = {parseStreamedToolCall, parseCompletionToolCall, completionPrompt, bridgeToolsEnabled};';
 
 const {code} = await transformWithOxc(source, 'content.ts', {
   lang: 'ts',
@@ -38,4 +38,53 @@ assert.equal(parsedWrite?.name, 'write_file');
 assert.equal(parsedWrite?.arguments.path, 'scripts/update.py');
 assert.equal(parsedWrite?.arguments.content, 'old = """value"""\nprint("updated")\n');
 
-console.log('edit_file and write_file parser regressions: PASS');
+const customToolCall = String.raw`<tool_call>{"name":"review_project","arguments":{"path":".","depth":2}}</tool_call>`;
+const parsedCustomTool = context.__parser.parseCompletionToolCall(customToolCall);
+assert.equal(parsedCustomTool?.name, 'review_project');
+assert.equal(parsedCustomTool?.arguments.path, '.');
+assert.equal(parsedCustomTool?.arguments.depth, 2);
+
+const reviewTool = {
+  type: 'function',
+  function: {
+    name: 'review_project',
+    description: 'Review project files.',
+    parameters: {
+      type: 'object',
+      properties: {path: {type: 'string'}},
+      required: ['path']
+    }
+  }
+};
+const forcedPrompt = context.__parser.completionPrompt(
+  [
+    {role: 'system', content: 'Use tools to inspect files.'},
+    {role: 'user', content: 'Review this project.'}
+  ],
+  [reviewTool],
+  {type: 'function', function: {name: 'review_project'}}
+);
+assert.match(forcedPrompt, /\[OPENAI_FUNCTION_TOOL_PROTOCOL_V1\]/);
+assert.match(forcedPrompt, /MUST call the function named "review_project"/);
+assert.match(forcedPrompt, /<tool_call>\{"name":"FUNCTION_NAME","arguments":\{\}\}<\/tool_call>/);
+assert.match(forcedPrompt, /"description":"Review project files\."/);
+assert.equal(context.__parser.bridgeToolsEnabled([reviewTool], 'auto'), true);
+assert.equal(context.__parser.bridgeToolsEnabled([reviewTool], 'none'), false);
+
+const continuationPrompt = context.__parser.completionPrompt(
+  [
+    {role: 'assistant', content: null, tool_calls: [{
+      id: 'call_previous',
+      type: 'function',
+      function: {name: 'review_project', arguments: '{"path":"."}'}
+    }]},
+    {role: 'tool', tool_call_id: 'call_previous', content: '{"files":["README.md"]}'}
+  ],
+  [reviewTool],
+  'auto'
+);
+assert.match(continuationPrompt, /\[ASSISTANT_TOOL_CALLS\]/);
+assert.match(continuationPrompt, /\[TOOL tool_call_id=call_previous\]/);
+assert.match(continuationPrompt, /README\.md/);
+
+console.log('tool parser and OpenAI prompt regressions: PASS');
