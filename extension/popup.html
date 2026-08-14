@@ -1,0 +1,551 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Local AI Agent</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --paper: #f5f0e5;
+      --paper-strong: #fffdf7;
+      --ink: #18231f;
+      --muted: #667069;
+      --line: #d8d1c2;
+      --accent: #e95f37;
+      --accent-dark: #bd3e1d;
+      --green: #1e7253;
+      --green-soft: #deeee6;
+      --amber-soft: #f8e7bd;
+      --red-soft: #f6dcd4;
+      --shadow: 0 14px 34px rgba(40, 47, 41, 0.13);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      width: 390px;
+      min-height: 560px;
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 100% 0, rgba(233, 95, 55, 0.18), transparent 34%),
+        linear-gradient(145deg, #faf7ee 0%, var(--paper) 62%, #ebe6d9 100%);
+      font: 13px/1.45 "Aptos", "Trebuchet MS", sans-serif;
+    }
+
+    body::before {
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      content: "";
+      opacity: 0.28;
+      background-image: repeating-linear-gradient(0deg, transparent 0 21px, rgba(24, 35, 31, 0.035) 22px);
+    }
+
+    button, input { font: inherit; }
+
+    button {
+      cursor: pointer;
+      border: 0;
+    }
+
+    button:focus-visible, input:focus-visible, label:has(input:focus-visible) {
+      outline: 3px solid rgba(233, 95, 55, 0.25);
+      outline-offset: 2px;
+    }
+
+    .app {
+      position: relative;
+      padding: 18px;
+    }
+
+    .masthead {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 15px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .brand-mark {
+      display: grid;
+      width: 38px;
+      height: 38px;
+      place-items: center;
+      border-radius: 11px 11px 11px 3px;
+      color: white;
+      background: var(--ink);
+      box-shadow: 4px 4px 0 var(--accent);
+      font: 700 20px/1 Georgia, serif;
+    }
+
+    h1, h2, p { margin: 0; }
+
+    h1 {
+      font: 700 18px/1.05 Georgia, "Times New Roman", serif;
+      letter-spacing: -0.25px;
+    }
+
+    .eyebrow {
+      margin-bottom: 3px;
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 800;
+      letter-spacing: 1.2px;
+      text-transform: uppercase;
+    }
+
+    .connection-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 9px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--muted);
+      background: rgba(255, 253, 247, 0.7);
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    .connection-pill::before {
+      width: 7px;
+      height: 7px;
+      content: "";
+      border-radius: 50%;
+      background: #a19f97;
+      box-shadow: 0 0 0 3px rgba(161, 159, 151, 0.15);
+    }
+
+    .connection-pill[data-state="connected"] {
+      color: var(--green);
+      border-color: #b9d5c8;
+      background: var(--green-soft);
+    }
+
+    .connection-pill[data-state="connected"]::before { background: var(--green); }
+
+    .card {
+      position: relative;
+      margin-top: 11px;
+      padding: 15px;
+      overflow: hidden;
+      border: 1px solid rgba(192, 183, 166, 0.75);
+      border-radius: 16px;
+      background: rgba(255, 253, 247, 0.9);
+      box-shadow: var(--shadow);
+    }
+
+    .card-heading {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 13px;
+    }
+
+    h2 {
+      font: 700 15px/1.2 Georgia, "Times New Roman", serif;
+    }
+
+    .card-copy {
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .field {
+      display: block;
+      margin-top: 10px;
+      color: #47514b;
+      font-size: 11px;
+      font-weight: 750;
+    }
+
+    .field input {
+      width: 100%;
+      height: 39px;
+      margin-top: 5px;
+      padding: 0 11px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      color: var(--ink);
+      background: #fffefb;
+      transition: border-color 150ms ease, box-shadow 150ms ease;
+    }
+
+    .field input:hover { border-color: #b9b09f; }
+
+    .field input:focus {
+      border-color: var(--accent);
+      outline: 0;
+      box-shadow: 0 0 0 3px rgba(233, 95, 55, 0.12);
+    }
+
+    #workspace { font-family: Consolas, "Courier New", monospace; font-size: 11px; }
+
+    .actions {
+      display: grid;
+      grid-template-columns: 1.45fr 1fr 0.8fr;
+      gap: 7px;
+      margin-top: 13px;
+    }
+
+    .button {
+      min-height: 37px;
+      padding: 0 11px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      color: var(--ink);
+      background: #f3eee3;
+      font-size: 11px;
+      font-weight: 800;
+      transition: transform 120ms ease, background 120ms ease;
+    }
+
+    .button:hover { background: #eae3d5; transform: translateY(-1px); }
+    .button:active { transform: translateY(0); }
+
+    .button.primary {
+      color: white;
+      border-color: var(--accent-dark);
+      background: var(--accent);
+      box-shadow: 0 5px 12px rgba(189, 62, 29, 0.2);
+    }
+
+    .button.primary:hover { background: var(--accent-dark); }
+    .button:disabled { cursor: wait; opacity: 0.65; transform: none; }
+
+    .settings-card[data-locked="true"] .settings-body {
+      pointer-events: none;
+      filter: grayscale(0.35);
+      opacity: 0.45;
+    }
+
+    .lock-note {
+      display: none;
+      padding: 5px 8px;
+      border-radius: 7px;
+      color: #735311;
+      background: var(--amber-soft);
+      font-size: 10px;
+      font-weight: 800;
+    }
+
+    .settings-card[data-locked="true"] .lock-note { display: inline-block; }
+
+    .scope {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 4px;
+      padding: 4px;
+      border-radius: 11px;
+      background: #ebe5d8;
+    }
+
+    .scope label {
+      position: relative;
+      cursor: pointer;
+    }
+
+    .scope input {
+      position: absolute;
+      opacity: 0;
+    }
+
+    .scope span {
+      display: block;
+      padding: 7px 8px;
+      border-radius: 8px;
+      color: var(--muted);
+      text-align: center;
+      font-size: 11px;
+      font-weight: 800;
+    }
+
+    .scope input:checked + span {
+      color: var(--ink);
+      background: var(--paper-strong);
+      box-shadow: 0 2px 6px rgba(43, 50, 45, 0.12);
+    }
+
+    .scope-note {
+      min-height: 32px;
+      padding: 8px 2px 7px;
+      color: var(--muted);
+      font-size: 10px;
+    }
+
+    .delay-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 9px 10px;
+      border: 1px solid #e2dccf;
+      border-radius: 10px;
+      background: #f8f4eb;
+    }
+
+    .delay-title {
+      display: block;
+      font-size: 11px;
+      font-weight: 800;
+    }
+
+    .delay-copy {
+      display: block;
+      margin-top: 1px;
+      color: var(--muted);
+      font-size: 9px;
+    }
+
+    .delay-row select {
+      height: 30px;
+      padding: 0 25px 0 9px;
+      cursor: pointer;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      color: var(--ink);
+      background: var(--paper-strong);
+      font-size: 11px;
+      font-weight: 800;
+    }
+
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 11px 0;
+      cursor: pointer;
+      border-top: 1px solid #e7e1d5;
+    }
+
+    .toggle-title {
+      display: block;
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .toggle-copy {
+      display: block;
+      margin-top: 2px;
+      color: var(--muted);
+      font-size: 10px;
+    }
+
+    .toggle-input {
+      position: absolute;
+      opacity: 0;
+    }
+
+    .toggle-row > span:last-child {
+      flex: 0 0 38px;
+    }
+
+    .toggle {
+      position: relative;
+      display: block;
+      flex: 0 0 auto;
+      width: 38px;
+      height: 22px;
+      border-radius: 99px;
+      background: #c9c5bb;
+      transition: background 160ms ease;
+    }
+
+    .toggle::after {
+      position: absolute;
+      top: 3px;
+      left: 3px;
+      width: 16px;
+      height: 16px;
+      content: "";
+      border-radius: 50%;
+      background: white;
+      box-shadow: 0 2px 5px rgba(24, 35, 31, 0.22);
+      transition: transform 160ms ease;
+    }
+
+    .toggle-input:checked + .toggle { background: var(--green); }
+    .toggle-input:checked + .toggle::after { transform: translateX(16px); }
+
+    .guardrail {
+      display: block;
+      margin-top: 8px;
+      padding: 9px 10px;
+      border-radius: 10px;
+      color: #69521f;
+      background: var(--amber-soft);
+      font-size: 10px;
+    }
+
+    .guardrail strong { margin-right: 4px; color: #523d11; }
+
+    .status-card {
+      display: grid;
+      grid-template-columns: 8px 1fr;
+      gap: 10px;
+      align-items: start;
+      min-height: 48px;
+      margin-top: 11px;
+      padding: 11px 12px;
+      border: 1px solid rgba(192, 183, 166, 0.75);
+      border-radius: 12px;
+      background: rgba(255, 253, 247, 0.72);
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      margin-top: 4px;
+      border-radius: 50%;
+      background: #9f9b91;
+    }
+
+    .status-card[data-state="success"] .status-dot { background: var(--green); }
+    .status-card[data-state="busy"] .status-dot { background: #cc8916; animation: pulse 1s infinite; }
+    .status-card[data-state="error"] { background: var(--red-soft); }
+    .status-card[data-state="error"] .status-dot { background: #b83d2d; }
+
+    #s {
+      min-width: 0;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
+      color: var(--muted);
+      font-size: 10px;
+      line-height: 1.45;
+    }
+
+    @keyframes pulse {
+      50% { opacity: 0.35; transform: scale(0.8); }
+    }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <header class="masthead">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">L</div>
+        <div>
+          <div class="eyebrow">Local bridge</div>
+          <h1>Local AI Agent</h1>
+        </div>
+      </div>
+      <div id="connectionBadge" class="connection-pill" data-state="offline">Offline</div>
+    </header>
+
+    <section class="card" aria-labelledby="connectionTitle">
+      <div class="card-heading">
+        <div>
+          <h2 id="connectionTitle">Connection</h2>
+          <p class="card-copy">Pair the browser with the daemon.</p>
+        </div>
+      </div>
+
+      <label class="field">
+        Pairing token
+        <input id="token" type="password" autocomplete="off" placeholder="Token from the daemon">
+      </label>
+
+      <label class="field">
+        Project path
+        <input id="workspace" placeholder="C:\path\to\project" spellcheck="false">
+      </label>
+
+      <div class="actions">
+        <button id="save" class="button primary" type="button">Connect</button>
+        <button id="attach" class="button" type="button">Attach tab</button>
+        <button id="health" class="button" type="button">Check</button>
+      </div>
+    </section>
+
+    <section id="settingsCard" class="card settings-card" data-locked="true" aria-labelledby="settingsTitle">
+      <div class="card-heading">
+        <div>
+          <h2 id="settingsTitle">Approvals</h2>
+          <p class="card-copy">Choose what can run without a prompt.</p>
+        </div>
+        <span class="lock-note">Connect first</span>
+      </div>
+
+      <div class="settings-body">
+        <div class="scope" role="radiogroup" aria-label="Approval scope">
+          <label>
+            <input id="scopeProject" type="radio" name="approvalScope" value="project" checked>
+            <span>This project</span>
+          </label>
+          <label>
+            <input id="scopeGlobal" type="radio" name="approvalScope" value="global">
+            <span>All projects</span>
+          </label>
+        </div>
+
+        <p id="scopeNote" class="scope-note"></p>
+
+        <label class="delay-row">
+          <span>
+            <span class="delay-title">Tool-result cooldown</span>
+            <span class="delay-copy">Wait before each automatic reply.</span>
+          </span>
+          <select id="resultDelay" aria-label="Automatic result delay">
+            <option value="3000">3 sec</option>
+            <option value="5000" selected>5 sec</option>
+            <option value="8000">8 sec</option>
+            <option value="12000">12 sec</option>
+          </select>
+        </label>
+
+        <label class="toggle-row">
+          <span>
+            <span class="toggle-title">Auto-approve edits</span>
+            <span class="toggle-copy">Create, overwrite, and edit files.</span>
+          </span>
+          <span>
+            <input id="approveEdits" class="toggle-input" type="checkbox">
+            <span class="toggle" aria-hidden="true"></span>
+          </span>
+        </label>
+
+        <label class="toggle-row">
+          <span>
+            <span class="toggle-title">Auto-approve deletes</span>
+            <span class="toggle-copy">Delete individual files in the workspace.</span>
+          </span>
+          <span>
+            <input id="approveDeletes" class="toggle-input" type="checkbox">
+            <span class="toggle" aria-hidden="true"></span>
+          </span>
+        </label>
+
+        <label class="toggle-row">
+          <span>
+            <span class="toggle-title">Auto-approve shell</span>
+            <span class="toggle-copy">Run terminal commands without asking first.</span>
+          </span>
+          <span>
+            <input id="approveShell" class="toggle-input" type="checkbox">
+            <span class="toggle" aria-hidden="true"></span>
+          </span>
+        </label>
+
+        <p class="guardrail"><strong>Use carefully</strong> The daemon still blocks known high-risk system commands.</p>
+      </div>
+    </section>
+
+    <div id="statusCard" class="status-card" data-state="neutral" role="status" aria-live="polite">
+      <span class="status-dot" aria-hidden="true"></span>
+      <div id="s">Waiting for connection.</div>
+    </div>
+  </main>
+
+  <script type="module" src="/src/popup.ts"></script>
+</body>
+</html>

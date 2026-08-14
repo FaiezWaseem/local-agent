@@ -1,0 +1,2 @@
+import path from 'node:path';
+export function safePath(root:string,input:string){const r=path.resolve(root);const p=path.resolve(r,input);if(p!==r&&!p.startsWith(r+path.sep))throw new Error('Path outside active workspace');return p;}

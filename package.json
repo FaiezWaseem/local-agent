@@ -1,0 +1,13 @@
+{
+    "name": "deepseek-local-agent",
+    "private": true,
+    "workspaces": [
+        "daemon",
+        "extension"
+    ],
+    "scripts": {
+        "build": "npm -w daemon run build && npm -w extension run build",
+        "dev:daemon": "npm -w daemon run dev",
+        "start": "npm -w daemon start"
+    }
+}

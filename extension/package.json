@@ -1,0 +1,1 @@
+{"name":"extension","type":"module","scripts":{"build":"vite build"},"devDependencies":{"@types/chrome":"latest","typescript":"latest","vite":"latest"}}
