@@ -6,11 +6,12 @@ Experimental Chrome extension + localhost Node daemon that gives DeepSeek, Qwen,
 - Automatic `<tool_call>` detection with a configurable 3-12 second result cooldown
 - Background `run_command` execution with live elapsed-time polling and resume after tab refresh
 - Unique `tool_call_id` correlation across requests, delayed results, failures, and SQLite history
-- Draggable in-page activity monitor with live tool and send-countdown states
+- Draggable in-page activity monitor with an active-tool command line, live send-countdown states, and expandable input/output history
 - Direct Connect and Stop controls in the floating monitor, scoped to the current tab
 - Automatic failure results so the model can correct malformed or failed tool calls
 - Strict tool-protocol reinforcement on every outgoing DeepSeek, Qwen, and Z.ai message, including a ban on provider-native tools
 - Provider-wide recovery for wrapped, fenced, and renderer-stripped JSON tool calls
+- Schema-aware recovery when chat rendering removes JSON escapes from large `edit_file` or `write_file` code strings
 - Copy-ready initial prompt in the extension popup
 - GLM/Z.ai streamed and rendered fenced-JSON tool-call detection when the model omits `<tool_call>` markup
 - Project/workspace boundary
@@ -19,6 +20,7 @@ Experimental Chrome extension + localhost Node daemon that gives DeepSeek, Qwen,
 - `read_file`, `write_file`, `edit_file`, `delete_file`, `list_directory`
 - `run_command`, `git_status`, `git_diff`, `git_log`
 - SQLite tool-call history at `~/.deepseek-local/history.db`
+- Compact human-readable daemon request logs with tool names, safe argument summaries, status, and timing
 - Blocks obvious high-risk system commands
 
 ## Install

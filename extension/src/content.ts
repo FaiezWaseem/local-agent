@@ -12,6 +12,25 @@ type AgentStatus = {
   message: string;
   url: string;
   ts: number;
+  tool?: string;
+  toolCallId?: string;
+  command?: string;
+};
+
+type ActiveTool = {
+  name: string;
+  callId: string;
+  command: string;
+};
+
+type DaemonHistoryItem = {
+  id: number;
+  ts: string;
+  call_id?: string;
+  tool: string;
+  args: string;
+  result: string;
+  ok: number;
 };
 
 type IndicatorPosition = {
@@ -27,6 +46,13 @@ type IndicatorRefs = {
   updated: HTMLElement;
   project: HTMLElement;
   count: HTMLElement;
+  activeTool: HTMLElement;
+  command: HTMLElement;
+  statusPanel: HTMLElement;
+  historyPanel: HTMLElement;
+  statusTab: HTMLButtonElement;
+  historyTab: HTMLButtonElement;
+  historyList: HTMLElement;
   collapse: HTMLButtonElement;
   connect: HTMLButtonElement;
   stop: HTMLButtonElement;
@@ -49,6 +75,7 @@ type PendingShellJob = {
   candidate_id: string;
   tool: 'run_command';
   started_at: string;
+  command?: string;
 };
 
 const TOOL_BLOCK_OPEN = '<tool_call>';
@@ -119,6 +146,7 @@ const DELETE_TOOLS = new Set(['delete_file']);
 const SHELL_TOOLS = new Set(['run_command']);
 const handled = new Set<string>();
 const streamedZaiCalls = new Map<string, ToolCall>();
+const streamedDomSuppressions = new Set<string>();
 const agentWindow = window as AgentWindow;
 let scanQueued = false;
 let nextAllowedSubmissionAt = 0;
@@ -131,6 +159,8 @@ let agentRunGeneration = 0;
 let indicatorControlsBusy = false;
 let protocolReinforcementEnabled = true;
 let resumingPendingShellJobs = false;
+let activeTool: ActiveTool | null = null;
+let streamedCallSequence = 0;
 
 function chatProviderName() {
   return CHAT_PROVIDER_NAMES[location.hostname] || 'AI chat';
@@ -176,11 +206,38 @@ function indicatorElements(host: HTMLElement): IndicatorRefs | null {
   const updated = root.querySelector<HTMLElement>('#updated');
   const project = root.querySelector<HTMLElement>('#project');
   const count = root.querySelector<HTMLElement>('#count');
+  const activeTool = root.querySelector<HTMLElement>('#active-tool');
+  const command = root.querySelector<HTMLElement>('#active-command');
+  const statusPanel = root.querySelector<HTMLElement>('#status-panel');
+  const historyPanel = root.querySelector<HTMLElement>('#history-panel');
+  const statusTab = root.querySelector<HTMLButtonElement>('#status-tab');
+  const historyTab = root.querySelector<HTMLButtonElement>('#history-tab');
+  const historyList = root.querySelector<HTMLElement>('#history-list');
   const collapse = root.querySelector<HTMLButtonElement>('#collapse');
   const connect = root.querySelector<HTMLButtonElement>('#connect');
   const stop = root.querySelector<HTMLButtonElement>('#stop');
-  if (!card || !state || !message || !updated || !project || !count || !collapse || !connect || !stop) return null;
-  return {host, card, state, message, updated, project, count, collapse, connect, stop};
+  if (!card || !state || !message || !updated || !project || !count || !activeTool || !command
+    || !statusPanel || !historyPanel || !statusTab || !historyTab || !historyList
+    || !collapse || !connect || !stop) return null;
+  return {
+    host,
+    card,
+    state,
+    message,
+    updated,
+    project,
+    count,
+    activeTool,
+    command,
+    statusPanel,
+    historyPanel,
+    statusTab,
+    historyTab,
+    historyList,
+    collapse,
+    connect,
+    stop
+  };
 }
 
 function clampIndicatorPosition(host: HTMLElement, position: IndicatorPosition) {
@@ -280,9 +337,133 @@ function setAgentRunning(running: boolean) {
   syncIndicatorControls();
 }
 
+function toolCommandLine(call: ToolCall) {
+  const args = call.arguments || {};
+  if (call.name === 'run_command') return `$ ${String(args.command || '')}`;
+
+  const path = typeof args.path === 'string' ? ` ${JSON.stringify(args.path)}` : '';
+  if (call.name === 'edit_file') {
+    const oldText = String(args.old_text ?? args.old_content ?? '');
+    const newText = String(args.new_text ?? args.new_content ?? '');
+    return `> edit_file${path} --old ${oldText.length} chars --new ${newText.length} chars`;
+  }
+  if (call.name === 'write_file') {
+    return `> write_file${path} --content ${String(args.content ?? '').length} chars`;
+  }
+  if (call.name === 'git_log' && args.limit != null) return `> git_log --limit ${String(args.limit)}`;
+  return `> ${call.name}${path}`;
+}
+
+function renderActiveTool() {
+  if (!indicatorRefs) return;
+  indicatorRefs.activeTool.textContent = activeTool?.name || 'Idle';
+  indicatorRefs.activeTool.title = activeTool?.callId || 'No active tool call';
+  indicatorRefs.command.textContent = activeTool?.command || 'No tool is running.';
+  indicatorRefs.command.dataset.active = String(Boolean(activeTool));
+}
+
+function setActiveTool(call: ToolCall, callId: string) {
+  activeTool = {name: call.name, callId, command: toolCommandLine(call)};
+  renderActiveTool();
+}
+
+function clearActiveTool(callId?: string) {
+  if (callId && activeTool?.callId !== callId) return;
+  activeTool = null;
+  renderActiveTool();
+}
+
+function historyPayload(value: string) {
+  let formatted = value;
+  try {
+    formatted = JSON.stringify(JSON.parse(value), null, 2);
+  } catch {
+    // Older history rows may contain plain text.
+  }
+  const limit = 120000;
+  return formatted.length > limit
+    ? `${formatted.slice(0, limit)}\n\n... truncated in monitor (${formatted.length - limit} more characters)`
+    : formatted;
+}
+
+function renderToolHistory(items: DaemonHistoryItem[]) {
+  if (!indicatorRefs) return;
+  const fragment = document.createDocumentFragment();
+
+  for (const item of items) {
+    const details = document.createElement('details');
+    details.className = 'history-item';
+
+    const summary = document.createElement('summary');
+    const tool = document.createElement('span');
+    tool.className = 'history-tool';
+    tool.textContent = item.tool || 'unknown';
+    const meta = document.createElement('span');
+    meta.className = item.ok ? 'history-meta success' : 'history-meta failure';
+    meta.textContent = `${item.ok ? 'OK' : 'Failed'} - ${new Date(item.ts).toLocaleTimeString()}`;
+    summary.append(tool, meta);
+
+    const callId = document.createElement('code');
+    callId.className = 'history-id';
+    callId.textContent = item.call_id || `history-${item.id}`;
+
+    const inputLabel = document.createElement('div');
+    inputLabel.className = 'io-label';
+    inputLabel.textContent = 'Input';
+    const input = document.createElement('pre');
+    input.textContent = historyPayload(item.args || '{}');
+
+    const outputLabel = document.createElement('div');
+    outputLabel.className = 'io-label';
+    outputLabel.textContent = 'Output';
+    const output = document.createElement('pre');
+    output.textContent = historyPayload(item.result || '{}');
+
+    details.append(summary, callId, inputLabel, input, outputLabel, output);
+    fragment.append(details);
+  }
+
+  indicatorRefs.historyList.replaceChildren(fragment);
+  if (!items.length) indicatorRefs.historyList.textContent = 'No completed tool calls yet.';
+}
+
+async function loadToolHistory() {
+  if (!indicatorRefs) return;
+  indicatorRefs.historyList.textContent = 'Loading tool-call history...';
+  try {
+    const {token} = await chrome.storage.local.get('token');
+    if (!token) throw new Error('Connect first to view daemon history.');
+    const response = await readDaemonResponse(await fetch('http://127.0.0.1:43121/history', {
+      headers: {authorization: `Bearer ${token}`}
+    }));
+    renderToolHistory(Array.isArray(response.items) ? response.items as DaemonHistoryItem[] : []);
+  } catch (error) {
+    if (indicatorRefs) indicatorRefs.historyList.textContent = `History unavailable: ${(error as Error).message}`;
+  }
+}
+
+function showIndicatorPanel(panel: 'status' | 'history') {
+  if (!indicatorRefs) return;
+  const historyVisible = panel === 'history';
+  indicatorRefs.card.dataset.view = panel;
+  indicatorRefs.statusPanel.hidden = historyVisible;
+  indicatorRefs.historyPanel.hidden = !historyVisible;
+  indicatorRefs.statusTab.dataset.active = String(!historyVisible);
+  indicatorRefs.historyTab.dataset.active = String(historyVisible);
+  if (historyVisible) void loadToolHistory();
+}
+
+function refreshVisibleHistory() {
+  if (indicatorRefs?.card.dataset.view === 'history') void loadToolHistory();
+}
+
 function bindIndicatorControls(refs: IndicatorRefs) {
   refs.connect.addEventListener('click', () => void connectAgent());
   refs.stop.addEventListener('click', () => void stopAgent());
+  refs.statusTab.addEventListener('click', () => showIndicatorPanel('status'));
+  refs.historyTab.addEventListener('click', () => showIndicatorPanel('history'));
+  refs.historyPanel.querySelector<HTMLButtonElement>('#history-refresh')
+    ?.addEventListener('click', () => void loadToolHistory());
   syncIndicatorControls();
 }
 
@@ -309,7 +490,7 @@ async function ensureIndicator() {
       :host { all: initial; }
       * { box-sizing: border-box; }
       #card {
-        width: 286px;
+        width: min(330px, calc(100vw - 16px));
         overflow: hidden;
         border: 1px solid rgba(255,255,255,.16);
         border-radius: 14px;
@@ -361,6 +542,19 @@ async function ensureIndicator() {
         text-overflow: ellipsis;
         white-space: nowrap;
       }
+      #active-tool {
+        max-width: 92px;
+        overflow: hidden;
+        padding: 3px 7px;
+        border: 1px solid rgba(255,255,255,.11);
+        border-radius: 999px;
+        color: #b9c8c0;
+        background: rgba(255,255,255,.06);
+        font: 800 9px/1 "Aptos", "Trebuchet MS", sans-serif;
+        letter-spacing: .25px;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
       .header-dot {
         width: 8px;
         height: 8px;
@@ -381,7 +575,47 @@ async function ensureIndicator() {
         font: 700 15px/1 sans-serif;
       }
       #collapse:hover { color: #fff; background: rgba(255,255,255,.12); }
-      .body { padding: 13px 14px 12px; }
+      .body { padding: 10px 14px 12px; }
+      [hidden] { display: none !important; }
+      .tabs {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 4px;
+        margin-bottom: 11px;
+        padding: 3px;
+        border-radius: 9px;
+        background: rgba(255,255,255,.055);
+      }
+      .tab {
+        min-height: 27px;
+        cursor: pointer;
+        border: 0;
+        border-radius: 7px;
+        color: #8fa199;
+        background: transparent;
+        font: 800 9px/1 "Aptos", "Trebuchet MS", sans-serif;
+        letter-spacing: .55px;
+        text-transform: uppercase;
+      }
+      .tab[data-active="true"] {
+        color: #eff7f1;
+        background: rgba(255,255,255,.1);
+        box-shadow: inset 0 0 0 1px rgba(255,255,255,.08);
+      }
+      #active-command {
+        max-height: 76px;
+        margin: 0 0 10px;
+        overflow: auto;
+        padding: 8px 9px;
+        border: 1px solid rgba(117,217,168,.15);
+        border-radius: 9px;
+        color: #98aaa1;
+        background: #101a16;
+        font: 10px/1.45 Consolas, "Courier New", monospace;
+        overflow-wrap: anywhere;
+        white-space: pre-wrap;
+      }
+      #active-command[data-active="true"] { color: #c9f4dc; }
       #state {
         margin-bottom: 6px;
         color: #75d9a8;
@@ -441,6 +675,88 @@ async function ensureIndicator() {
         font-size: 9px;
       }
       #count { color: #b5c2bc; font-weight: 700; }
+      .history-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        margin-bottom: 9px;
+        color: #c8d5ce;
+        font-size: 10px;
+        font-weight: 800;
+        letter-spacing: .45px;
+        text-transform: uppercase;
+      }
+      #history-refresh {
+        cursor: pointer;
+        border: 0;
+        color: #75d9a8;
+        background: transparent;
+        font: 800 9px/1 "Aptos", "Trebuchet MS", sans-serif;
+        text-transform: uppercase;
+      }
+      #history-list {
+        max-height: min(430px, calc(100vh - 190px));
+        overflow: auto;
+        color: #91a39a;
+      }
+      .history-item {
+        margin-bottom: 6px;
+        overflow: hidden;
+        border: 1px solid rgba(255,255,255,.09);
+        border-radius: 9px;
+        background: rgba(255,255,255,.035);
+      }
+      .history-item summary {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 8px 9px;
+        cursor: pointer;
+        list-style: none;
+      }
+      .history-item summary::-webkit-details-marker { display: none; }
+      .history-item[open] summary { border-bottom: 1px solid rgba(255,255,255,.08); }
+      .history-tool {
+        overflow: hidden;
+        color: #edf6f1;
+        font-weight: 800;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .history-meta { flex: 0 0 auto; font-size: 8px; font-weight: 800; text-transform: uppercase; }
+      .history-meta.success { color: #75d9a8; }
+      .history-meta.failure { color: #ff8d7d; }
+      .history-id {
+        display: block;
+        overflow: hidden;
+        padding: 7px 9px 0;
+        color: #82958b;
+        font: 8px/1.3 Consolas, monospace;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .io-label {
+        padding: 8px 9px 4px;
+        color: #f1c46f;
+        font-size: 8px;
+        font-weight: 850;
+        letter-spacing: .7px;
+        text-transform: uppercase;
+      }
+      .history-item pre {
+        max-height: 190px;
+        margin: 0 7px 8px;
+        overflow: auto;
+        padding: 8px;
+        border-radius: 7px;
+        color: #c8d5ce;
+        background: #101a16;
+        font: 9px/1.4 Consolas, "Courier New", monospace;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
       #card[data-state="executing"] .header-dot,
       #card[data-state="background"] .header-dot,
       #card[data-state="detected"] .header-dot,
@@ -457,6 +773,11 @@ async function ensureIndicator() {
       #card[data-state="approval"] #state,
       #card[data-state="cooldown"] #state,
       #card[data-state="sending"] #state { color: #f1c46f; }
+      #card[data-state="executing"] #active-tool,
+      #card[data-state="background"] #active-tool,
+      #card[data-state="approval"] #active-tool,
+      #card[data-state="cooldown"] #active-tool,
+      #card[data-state="sending"] #active-tool { color: #f1c46f; border-color: rgba(241,183,77,.24); }
       #card[data-state="error"] .header-dot {
         background: #ef715f;
         box-shadow: 0 0 0 4px rgba(239,113,95,.14);
@@ -467,33 +788,45 @@ async function ensureIndicator() {
         box-shadow: 0 0 0 4px rgba(127,145,136,.12);
       }
       #card[data-state="stopped"] #state { color: #aebdb6; }
-      #card[data-collapsed="true"] { width: 196px; }
+      #card[data-collapsed="true"] { width: min(250px, calc(100vw - 16px)); }
       #card[data-collapsed="true"] .body,
       #card[data-collapsed="true"] #project { display: none; }
       #card[data-collapsed="true"] #handle { border-bottom: 0; }
       @keyframes pulse { 50% { opacity: .35; transform: scale(.76); } }
     </style>
-    <section id="card" data-state="attached" data-collapsed="false" aria-live="polite">
+    <section id="card" data-state="attached" data-view="status" data-collapsed="false" aria-live="polite">
       <header id="handle">
         <span class="mark" aria-hidden="true">L</span>
         <span class="heading">
           <span class="title">Local agent</span>
           <span id="project">Connecting...</span>
         </span>
+        <span id="active-tool" title="No active tool call">Idle</span>
         <span class="header-dot" aria-hidden="true"></span>
         <button id="collapse" type="button" aria-label="Collapse local agent status">-</button>
       </header>
       <div class="body">
-        <div id="state">Ready</div>
-        <div id="message">Watching for local tool calls.</div>
-        <div class="actions" aria-label="Local agent controls">
-          <button id="connect" class="action" type="button">Connect</button>
-          <button id="stop" class="action" type="button">Stop</button>
-        </div>
-        <footer class="footer">
-          <span id="updated">Updated now</span>
-          <span id="count">Tools: 0</span>
-        </footer>
+        <nav class="tabs" aria-label="Local agent views">
+          <button id="status-tab" class="tab" data-active="true" type="button">Status</button>
+          <button id="history-tab" class="tab" data-active="false" type="button">History</button>
+        </nav>
+        <section id="status-panel">
+          <pre id="active-command" data-active="false">No tool is running.</pre>
+          <div id="state">Ready</div>
+          <div id="message">Watching for local tool calls.</div>
+          <div class="actions" aria-label="Local agent controls">
+            <button id="connect" class="action" type="button">Connect</button>
+            <button id="stop" class="action" type="button">Stop</button>
+          </div>
+          <footer class="footer">
+            <span id="updated">Updated now</span>
+            <span id="count">Tools: 0</span>
+          </footer>
+        </section>
+        <section id="history-panel" hidden>
+          <div class="history-head"><span>Past tool calls</span><button id="history-refresh" type="button">Refresh</button></div>
+          <div id="history-list">Open this tab to load history.</div>
+        </section>
       </div>
     </section>`;
 
@@ -521,6 +854,7 @@ async function ensureIndicator() {
   bindIndicatorDrag(indicatorRefs);
   bindIndicatorControls(indicatorRefs);
   if (values.agentStatus) renderIndicator(values.agentStatus as AgentStatus);
+  else renderActiveTool();
   return indicatorRefs;
 }
 
@@ -531,6 +865,14 @@ function renderIndicator(status: AgentStatus) {
   indicatorRefs.message.textContent = status.message;
   indicatorRefs.updated.textContent = `Updated ${new Date(status.ts).toLocaleTimeString()}`;
   indicatorRefs.count.textContent = `Tools: ${toolCallCount}`;
+  if (activeTool) {
+    renderActiveTool();
+  } else {
+    indicatorRefs.activeTool.textContent = status.tool || 'Idle';
+    indicatorRefs.activeTool.title = status.toolCallId || 'No active tool call';
+    indicatorRefs.command.textContent = status.command || 'No tool is running.';
+    indicatorRefs.command.dataset.active = String(Boolean(status.tool));
+  }
 }
 
 function hash(value: string) {
@@ -646,8 +988,124 @@ function ensureArgumentsObject(value: unknown) {
   return value as Record<string, unknown>;
 }
 
+type StringField = {
+  key: string;
+  keyStart: number;
+  valueStart: number;
+};
+
+function stringFields(payload: string, keys: string[]) {
+  const matches: StringField[] = [];
+  for (const key of keys) {
+    const pattern = new RegExp(`"${key}"\\s*:\\s*"`, 'g');
+    for (const match of payload.matchAll(pattern)) {
+      if (match.index == null) continue;
+      matches.push({key, keyStart: match.index, valueStart: match.index + match[0].length});
+    }
+  }
+  return matches.sort((left, right) => left.keyStart - right.keyStart);
+}
+
+function decodeRenderedJsonString(value: string) {
+  let decoded = '';
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+    if (character !== '\\' || index + 1 >= value.length) {
+      decoded += character;
+      continue;
+    }
+
+    const escaped = value[index + 1];
+    const simpleEscapes: Record<string, string> = {
+      '"': '"',
+      '\\': '\\',
+      '/': '/',
+      b: '\b',
+      f: '\f',
+      n: '\n',
+      r: '\r',
+      t: '\t'
+    };
+    if (Object.hasOwn(simpleEscapes, escaped)) {
+      decoded += simpleEscapes[escaped];
+      index += 1;
+      continue;
+    }
+
+    if (escaped === 'u') {
+      const codePoint = value.slice(index + 2, index + 6);
+      if (/^[0-9a-f]{4}$/i.test(codePoint)) {
+        decoded += String.fromCharCode(Number.parseInt(codePoint, 16));
+        index += 5;
+        continue;
+      }
+    }
+
+    decoded += `\\${escaped}`;
+    index += 1;
+  }
+  return decoded;
+}
+
+function fieldValueBefore(payload: string, field: StringField, nextField: StringField) {
+  const value = payload.slice(field.valueStart, nextField.keyStart);
+  const boundary = /"\s*,\s*$/.exec(value);
+  if (!boundary) throw new Error(`Could not recover the ${field.key} field boundary.`);
+  return decodeRenderedJsonString(value.slice(0, boundary.index));
+}
+
+function finalFieldValue(payload: string, field: StringField) {
+  const value = payload.slice(field.valueStart).trimEnd();
+  const boundary = /"\s*}\s*}\s*$/.exec(value);
+  if (!boundary) throw new Error(`Could not recover the ${field.key} field boundary.`);
+  return decodeRenderedJsonString(value.slice(0, boundary.index));
+}
+
+function recoverRenderedTextToolCall(payload: string): ToolCall | null {
+  const text = stripCodeFence(payload).trim();
+  const name = /"name"\s*:\s*"([A-Za-z_][\w-]*)"/.exec(text)?.[1];
+  if (name !== 'edit_file' && name !== 'write_file') return null;
+
+  const pathField = stringFields(text, ['path'])[0];
+  if (!pathField) return null;
+
+  if (name === 'write_file') {
+    const contentField = stringFields(text, ['content']).at(-1);
+    if (!contentField || contentField.keyStart <= pathField.keyStart) return null;
+    return {
+      name,
+      arguments: {
+        path: fieldValueBefore(text, pathField, contentField),
+        content: finalFieldValue(text, contentField)
+      }
+    };
+  }
+
+  const oldField = stringFields(text, ['old_text', 'old_content']).find(field => field.keyStart > pathField.keyStart);
+  const newField = stringFields(text, ['new_text', 'new_content'])
+    .filter(field => field.keyStart > (oldField?.keyStart ?? -1))
+    .at(-1);
+  if (!oldField || !newField) return null;
+
+  return {
+    name,
+    arguments: {
+      path: fieldValueBefore(text, pathField, oldField),
+      old_text: fieldValueBefore(text, oldField, newField),
+      new_text: finalFieldValue(text, newField)
+    }
+  };
+}
+
 function parseToolBlock(payload: string) {
-  const parsed = JSON.parse(extractFirstJsonValue(payload)) as ToolCall;
+  let parsed: ToolCall;
+  try {
+    parsed = JSON.parse(extractFirstJsonValue(payload)) as ToolCall;
+  } catch (error) {
+    const recovered = recoverRenderedTextToolCall(payload);
+    if (!recovered) throw error;
+    parsed = recovered;
+  }
   if (!parsed || typeof parsed.name !== 'string') {
     throw new Error('Tool payload must contain a string "name".');
   }
@@ -661,19 +1119,22 @@ function parseToolBlock(payload: string) {
 function parseProviderJsonToolCall(payload: string) {
   if (!shouldReinforceProtocol()) return null;
 
+  let parsed: Record<string, unknown>;
   try {
-    const parsed = JSON.parse(stripCodeFence(payload)) as Record<string, unknown>;
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
-    if (Object.keys(parsed).sort().join(',') !== 'arguments,name') return null;
-    if (typeof parsed.name !== 'string' || !LOCAL_TOOL_NAMES.has(parsed.name)) return null;
-
-    return {
-      name: parsed.name,
-      arguments: ensureArgumentsObject(parsed.arguments)
-    } satisfies ToolCall;
+    parsed = JSON.parse(stripCodeFence(payload)) as Record<string, unknown>;
   } catch {
-    return null;
+    const recovered = recoverRenderedTextToolCall(payload);
+    if (!recovered) return null;
+    parsed = recovered as unknown as Record<string, unknown>;
   }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  if (Object.keys(parsed).sort().join(',') !== 'arguments,name') return null;
+  if (typeof parsed.name !== 'string' || !LOCAL_TOOL_NAMES.has(parsed.name)) return null;
+
+  return {
+    name: parsed.name,
+    arguments: ensureArgumentsObject(parsed.arguments)
+  } satisfies ToolCall;
 }
 
 function installZaiStreamBridge() {
@@ -687,7 +1148,8 @@ function installZaiStreamBridge() {
     const call = parseProviderJsonToolCall(answer);
     if (!call) return;
 
-    const id = toolCallIdentity(call);
+    const baseId = toolCallIdentity(call);
+    const id = `stream:${++streamedCallSequence}:${baseId}`;
     streamedZaiCalls.set(id, call);
     queueScan();
   });
@@ -699,6 +1161,7 @@ function parseArgumentsPayload(payload: string) {
 
 type ExtractedToolBlock = {
   payload: string;
+  rawPayload: string;
   repaired: boolean;
 };
 
@@ -733,6 +1196,7 @@ function extractToolBlocks(text: string) {
       cursor = firstCloseAt + TOOL_BLOCK_CLOSE.length;
       continue;
     }
+    const rawPayload = text.slice(jsonStart, firstCloseAt).replace(/```\s*$/i, '').trim();
 
     const expectedClosers: string[] = [];
     let inString = false;
@@ -784,7 +1248,7 @@ function extractToolBlocks(text: string) {
     if (closeAt === -1) break;
 
     if (jsonEnd !== -1) {
-      blocks.push({payload: text.slice(jsonStart, jsonEnd), repaired: false});
+      blocks.push({payload: text.slice(jsonStart, jsonEnd), rawPayload, repaired: false});
     } else {
       const canRepair = !syntaxError && !inString && expectedClosers.length > 0 && expectedClosers.length <= 4;
       const suffix = canRepair ? [...expectedClosers].reverse().join('') : '';
@@ -795,6 +1259,7 @@ function extractToolBlocks(text: string) {
       }
       blocks.push({
         payload: payload + suffix,
+        rawPayload,
         repaired: canRepair
       });
     }
@@ -810,7 +1275,10 @@ async function updateStatus(state: string, message: string) {
     state,
     message,
     url: location.href,
-    ts: Date.now()
+    ts: Date.now(),
+    tool: activeTool?.name,
+    toolCallId: activeTool?.callId,
+    command: activeTool?.command
   };
   await ensureIndicator();
   renderIndicator(status);
@@ -886,9 +1354,11 @@ async function stopAgent() {
   protocolReinforcementEnabled = false;
   setAgentRunning(false);
   streamedZaiCalls.clear();
+  streamedDomSuppressions.clear();
   protocolReinforcementPending = false;
   protocolSendReplay = false;
   nextAllowedSubmissionAt = 0;
+  clearActiveTool();
 
   const composer = findComposer();
   if (composer && composerText(composer).includes('<tool_result>')) {
@@ -994,7 +1464,8 @@ async function execute(call: ToolCall, callId: string, candidateId: string) {
       tool_call_id: callId,
       candidate_id: candidateId,
       tool: 'run_command',
-      started_at: String(result.started_at || new Date().toISOString())
+      started_at: String(result.started_at || new Date().toISOString()),
+      command: toolCommandLine(call)
     });
     return pollShellJob(callId, String(token));
   }
@@ -1275,10 +1746,19 @@ async function feed(result: unknown) {
 
 type ToolCandidate = {
   id: string;
+  baseId: string;
+  source: 'dom' | 'stream';
   call?: ToolCall;
   error?: string;
   repaired?: boolean;
   toolName?: string;
+};
+
+type SourcedCandidate = {
+  baseId: string;
+  element: HTMLElement;
+  order: number;
+  value: Omit<ToolCandidate, 'id' | 'baseId' | 'source'>;
 };
 
 function isUserAuthored(element: HTMLElement) {
@@ -1291,11 +1771,76 @@ function isUserAuthored(element: HTMLElement) {
   ].join(',')));
 }
 
+function candidateMessageSource(element: HTMLElement) {
+  return element.closest<HTMLElement>([
+    '[data-message-id]',
+    '[data-msg-id]',
+    '[data-message-author-role="assistant" i]',
+    '[data-role="assistant" i]',
+    '[data-author="assistant" i]',
+    '[data-testid*="assistant-message" i]',
+    '[class~="assistant-message" i]'
+  ].join(',')) || element;
+}
+
+function elementPath(element: HTMLElement) {
+  const parts: number[] = [];
+  let current: HTMLElement | null = element;
+  while (current?.parentElement && parts.length < 18) {
+    const siblings = current.parentElement.children;
+    parts.push(Array.prototype.indexOf.call(siblings, current));
+    current = current.parentElement;
+  }
+  return parts.reverse().join('.');
+}
+
+function candidateSourceKey(element: HTMLElement) {
+  const source = candidateMessageSource(element);
+  for (const attribute of ['data-message-id', 'data-msg-id']) {
+    const value = source.getAttribute(attribute);
+    if (value) return `${attribute}:${value}`;
+  }
+  return `path:${elementPath(source)}`;
+}
+
+function latestSourcedCandidate(records: SourcedCandidate[]) {
+  const groups = new Map<string, SourcedCandidate[]>();
+  for (const record of records) {
+    const group = groups.get(record.baseId) || [];
+    group.push(record);
+    groups.set(record.baseId, group);
+  }
+
+  const canonical: SourcedCandidate[] = [];
+  for (const group of groups.values()) {
+    const byElement = new Map<HTMLElement, SourcedCandidate>();
+    for (const record of group) byElement.set(record.element, record);
+    const unique = [...byElement.values()];
+    canonical.push(...unique.filter(record => !unique.some(other => (
+      other.element !== record.element && record.element.contains(other.element)
+    ))));
+  }
+
+  const latest = canonical.sort((left, right) => left.order - right.order).at(-1);
+  if (!latest) return undefined;
+
+  const id = hash(`occurrence:${latest.baseId}:${candidateSourceKey(latest.element)}`);
+  if (streamedDomSuppressions.has(latest.baseId)) {
+    streamedDomSuppressions.delete(latest.baseId);
+    handled.add(id);
+    return undefined;
+  }
+  if (handled.has(id)) return undefined;
+  return {id, baseId: latest.baseId, source: 'dom', ...latest.value} satisfies ToolCandidate;
+}
+
 function latestRenderedJsonCandidate() {
-  const candidates = new Map<string, ToolCandidate>();
+  const candidates: SourcedCandidate[] = [];
   const nodes = document.querySelectorAll('pre,code');
+  let order = 0;
 
   for (const node of nodes) {
+    order += 1;
     const element = node as HTMLElement;
     if (element.closest('form,textarea,[role="textbox"],[contenteditable]:not([contenteditable="false"])')) continue;
     if (isUserAuthored(element)) continue;
@@ -1306,12 +1851,10 @@ function latestRenderedJsonCandidate() {
     const call = parseProviderJsonToolCall(text);
     if (!call) continue;
 
-    const id = toolCallIdentity(call);
-    candidates.delete(id);
-    candidates.set(id, {id, call});
+    candidates.push({baseId: toolCallIdentity(call), element, order, value: {call}});
   }
 
-  return [...candidates.values()].reverse().find(candidate => !handled.has(candidate.id));
+  return latestSourcedCandidate(candidates);
 }
 
 function inferToolName(payload: string) {
@@ -1319,13 +1862,24 @@ function inferToolName(payload: string) {
 }
 
 function findToolCandidates() {
+  const latestStream = [...streamedZaiCalls.entries()].at(-1);
+  if (latestStream) {
+    const [id, call] = latestStream;
+    if (!handled.has(id)) {
+      return [{id, baseId: toolCallIdentity(call), source: 'stream', call} satisfies ToolCandidate];
+    }
+    return [];
+  }
+
   const renderedJsonCandidate = latestRenderedJsonCandidate();
   if (renderedJsonCandidate) return [renderedJsonCandidate];
 
-  const candidates = new Map<string, ToolCandidate>();
+  const candidates: SourcedCandidate[] = [];
   const nodes = document.querySelectorAll('pre,code,article,div,p,span,tool_call,tool-call');
+  let order = 0;
 
   for (const node of nodes) {
+    order += 1;
     const element = node as HTMLElement;
     if (element.closest('form,textarea,[role="textbox"],[contenteditable]:not([contenteditable="false"])')) continue;
     if (isUserAuthored(element)) continue;
@@ -1335,25 +1889,39 @@ function findToolCandidates() {
 
     const renderedJsonCall = parseProviderJsonToolCall(text);
     if (renderedJsonCall) {
-      const id = toolCallIdentity(renderedJsonCall);
-      candidates.delete(id);
-      candidates.set(id, {id, call: renderedJsonCall});
+      candidates.push({
+        baseId: toolCallIdentity(renderedJsonCall),
+        element,
+        order,
+        value: {call: renderedJsonCall}
+      });
     }
 
     for (const block of extractToolBlocks(text)) {
-      const {payload} = block;
+      const {payload, rawPayload} = block;
       try {
-        const call = parseToolBlock(payload);
-        const id = toolCallIdentity(call);
-        candidates.delete(id);
-        candidates.set(id, {id, call, repaired: block.repaired});
+        let call: ToolCall;
+        try {
+          call = parseToolBlock(payload);
+        } catch (error) {
+          if (rawPayload === payload) throw error;
+          call = parseToolBlock(rawPayload);
+        }
+        candidates.push({
+          baseId: toolCallIdentity(call),
+          element,
+          order,
+          value: {call, repaired: block.repaired}
+        });
       } catch (error) {
-        const id = hash(`tool_block_error:${payload}`);
-        candidates.delete(id);
-        candidates.set(id, {
-          id,
-          toolName: inferToolName(payload),
-          error: `Found <tool_call> markup but could not parse its JSON: ${(error as Error).message}`
+        candidates.push({
+          baseId: hash(`tool_block_error:${rawPayload}`),
+          element,
+          order,
+          value: {
+            toolName: inferToolName(rawPayload),
+            error: `Found <tool_call> markup but could not parse its JSON: ${(error as Error).message}`
+          }
         });
       }
     }
@@ -1361,32 +1929,32 @@ function findToolCandidates() {
     for (const match of text.matchAll(LABELED_TOOL_RE)) {
       const toolName = match[1];
       const argsPayload = match[2];
-      const id = hash(`labeled_tool:${toolName}\n${argsPayload}`);
-      candidates.delete(id);
       try {
-        candidates.set(id, {
-          id,
-          call: {
-            name: toolName,
-            arguments: parseArgumentsPayload(argsPayload)
-          }
+        const call = {
+          name: toolName,
+          arguments: parseArgumentsPayload(argsPayload)
+        } satisfies ToolCall;
+        candidates.push({
+          baseId: toolCallIdentity(call),
+          element,
+          order,
+          value: {call}
         });
       } catch (error) {
-        candidates.set(id, {
-          id,
-          toolName,
-          error: `Found "Call Tool" output for ${toolName} but could not parse Arguments JSON: ${(error as Error).message}`
+        candidates.push({
+          baseId: hash(`labeled_tool_error:${toolName}\n${argsPayload}`),
+          element,
+          order,
+          value: {
+            toolName,
+            error: `Found "Call Tool" output for ${toolName} but could not parse Arguments JSON: ${(error as Error).message}`
+          }
         });
       }
     }
   }
 
-  for (const [id, call] of streamedZaiCalls) {
-    candidates.delete(id);
-    candidates.set(id, {id, call});
-  }
-
-  const latestCandidate = [...candidates.values()].reverse().find(candidate => !handled.has(candidate.id));
+  const latestCandidate = latestSourcedCandidate(candidates);
   return latestCandidate ? [latestCandidate] : [];
 }
 
@@ -1413,12 +1981,14 @@ async function returnFailureToAI(
         : 'Review the error and retry with corrected tool arguments if appropriate.'
     });
     if (!stillRunning()) return;
+    clearActiveTool(callId);
     await updateStatus(
       'waiting',
       `Reported the ${phase} failure for ${tool} (${callId}) to ${chatProviderName()}. Waiting for a corrected call.`
     );
   } catch (deliveryError) {
     if (!stillRunning()) return;
+    clearActiveTool(callId);
     const deliveryMessage = (deliveryError as Error).message;
     await updateStatus('error', `${error} Could not return this failure to ${chatProviderName()}: ${deliveryMessage}`);
     console.error('[Local AI Agent] Could not return failure to the chat.', deliveryError);
@@ -1442,6 +2012,12 @@ async function resumePendingShellJobs() {
 
     for (const job of jobs) {
       if (!agentRunning) return;
+      activeTool = {
+        name: job.tool,
+        callId: job.tool_call_id,
+        command: job.command || '> run_command [resumed background job]'
+      };
+      renderActiveTool();
 
       let result: Record<string, unknown>;
       try {
@@ -1450,6 +2026,7 @@ async function resumePendingShellJobs() {
         if (!agentRunning) return;
         const message = (error as Error).message;
         removePendingShellJob(job.tool_call_id);
+        clearActiveTool(job.tool_call_id);
         await returnFailureToAI(job.tool, 'execution', message, job.tool_call_id);
         continue;
       }
@@ -1459,6 +2036,8 @@ async function resumePendingShellJobs() {
         await feed({tool: job.tool, ...result});
         removePendingShellJob(job.tool_call_id);
         if (!agentRunning) return;
+        clearActiveTool(job.tool_call_id);
+        refreshVisibleHistory();
         await updateStatus(
           'waiting',
           `Finished ${job.tool} (${job.tool_call_id}). Waiting for the next <tool_call>.`
@@ -1489,11 +2068,13 @@ async function scan() {
     const {id} = candidate;
     if (handled.has(id)) continue;
     handled.add(id);
+    if (candidate.source === 'stream') streamedDomSuppressions.add(candidate.baseId);
     streamedZaiCalls.delete(id);
     const callId = createToolCallId();
 
     if (candidate.error) {
       toolCallCount += 1;
+      setActiveTool({name: candidate.toolName || 'unknown'}, callId);
       await updateStatus('error', `${candidate.error} Tool call ID: ${callId}.`);
       if (!stillRunning()) return;
       await returnFailureToAI(candidate.toolName || 'unknown', 'parse', candidate.error, callId);
@@ -1504,6 +2085,7 @@ async function scan() {
     if (!call) continue;
 
     toolCallCount += 1;
+    setActiveTool(call, callId);
     const recoveryNote = candidate.repaired ? ' Recovered missing trailing JSON delimiter.' : '';
     await updateStatus('executing', `Tool call triggered: ${call.name} (${callId}).${recoveryNote} Running locally.`);
 
@@ -1525,6 +2107,8 @@ async function scan() {
       await feed({tool: call.name, ...result});
       removePendingShellJob(callId);
       if (!stillRunning()) return;
+      clearActiveTool(callId);
+      refreshVisibleHistory();
       await updateStatus('waiting', `Finished ${call.name} (${callId}). Waiting for the next <tool_call>.`);
     } catch (error) {
       if (!stillRunning()) return;

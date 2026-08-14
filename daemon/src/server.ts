@@ -1,4 +1,4 @@
-import Fastify from 'fastify';
+import Fastify, {LogController} from 'fastify';
 import cors from '@fastify/cors';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -8,8 +8,13 @@ import {fsTool} from './tools/filesystem.js';
 import {git} from './tools/git.js';
 import {log, history} from './db/history.js';
 import {getShellJob, startShellJob} from './jobs.js';
+import {installRequestLogging} from './request-log.js';
 
-const app = Fastify({logger: true});
+const app = Fastify({
+  logger: false,
+  logController: new LogController({disableRequestLogging: true})
+});
+installRequestLogging(app);
 await app.register(cors, {
   origin: [
     /^chrome-extension:\/\//,
