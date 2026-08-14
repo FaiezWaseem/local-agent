@@ -130,6 +130,7 @@ let agentRunning = false;
 let agentRunGeneration = 0;
 let indicatorControlsBusy = false;
 let protocolReinforcementEnabled = true;
+let resumingPendingShellJobs = false;
 
 function chatProviderName() {
   return CHAT_PROVIDER_NAMES[location.hostname] || 'AI chat';
@@ -540,6 +541,48 @@ function hash(value: string) {
   return String(result);
 }
 
+function createToolCallId() {
+  return `call_${crypto.randomUUID()}`;
+}
+
+function readPendingShellJobs() {
+  try {
+    const value = JSON.parse(sessionStorage.getItem(PENDING_SHELL_JOBS_KEY) || '[]') as unknown;
+    if (!Array.isArray(value)) return [];
+    return value.filter((job): job is PendingShellJob => {
+      if (!job || typeof job !== 'object') return false;
+      const candidate = job as Partial<PendingShellJob>;
+      return typeof candidate.tool_call_id === 'string'
+        && typeof candidate.candidate_id === 'string'
+        && candidate.tool === 'run_command'
+        && typeof candidate.started_at === 'string';
+    });
+  } catch {
+    return [];
+  }
+}
+
+function writePendingShellJobs(jobs: PendingShellJob[]) {
+  try {
+    sessionStorage.setItem(PENDING_SHELL_JOBS_KEY, JSON.stringify(jobs));
+  } catch {
+    // The active poll still completes when session storage is unavailable.
+  }
+}
+
+function savePendingShellJob(job: PendingShellJob) {
+  const jobs = readPendingShellJobs().filter(item => item.tool_call_id !== job.tool_call_id);
+  writePendingShellJobs([...jobs, job]);
+}
+
+function removePendingShellJob(toolCallId: string) {
+  writePendingShellJobs(readPendingShellJobs().filter(job => job.tool_call_id !== toolCallId));
+}
+
+function rememberPendingCandidates() {
+  for (const job of readPendingShellJobs()) handled.add(job.candidate_id);
+}
+
 function toolCallIdentity(call: ToolCall) {
   return hash(`tool_call:${JSON.stringify({name: call.name, arguments: call.arguments || {}})}`);
 }
@@ -660,10 +703,16 @@ type ExtractedToolBlock = {
 };
 
 function findJsonStart(text: string, start: number, closeAt: number) {
-  for (let index = start; index < closeAt; index += 1) {
-    if (text[index] === '{' || text[index] === '[') return index;
+  let index = start;
+  while (index < closeAt && /\s/.test(text[index])) index += 1;
+
+  if (text.startsWith('```', index)) {
+    index += 3;
+    if (text.slice(index, index + 4).toLowerCase() === 'json') index += 4;
+    while (index < closeAt && /\s/.test(text[index])) index += 1;
   }
-  return -1;
+
+  return text[index] === '{' || text[index] === '[' ? index : -1;
 }
 
 function extractToolBlocks(text: string) {
@@ -818,6 +867,8 @@ async function connectAgent() {
       indicatorRefs.project.textContent = `${chatProviderName()} - ${projectName(connectedWorkspace)}`;
     }
     await updateStatus('waiting', `Connected to ${projectName(connectedWorkspace)}. Waiting for a local tool call.`);
+    rememberPendingCandidates();
+    void resumePendingShellJobs();
     queueScan();
   } catch (error) {
     setAgentRunning(false);
@@ -874,7 +925,43 @@ function confirmationDetail(call: ToolCall) {
   return String(call.arguments?.path || '');
 }
 
-async function execute(call: ToolCall) {
+async function pollShellJob(toolCallId: string, token: string) {
+  const generation = agentRunGeneration;
+  const stillRunning = () => agentRunning && generation === agentRunGeneration;
+
+  while (stillRunning()) {
+    let response: Response;
+    try {
+      response = await fetch(`http://127.0.0.1:43121/tool/${encodeURIComponent(toolCallId)}`, {
+        headers: {authorization: `Bearer ${token}`}
+      });
+    } catch (error) {
+      await updateStatus(
+        'background',
+        `run_command ${toolCallId} is still pending. The daemon is unavailable; retrying in ${SHELL_JOB_POLL_MS / 1000}s.`
+      );
+      await new Promise(resolve => setTimeout(resolve, SHELL_JOB_POLL_MS));
+      continue;
+    }
+
+    const result = await readDaemonResponse(response);
+    if (result.pending !== true) return result;
+
+    const startedAt = Date.parse(String(result.started_at || ''));
+    const elapsedSeconds = Number.isFinite(startedAt)
+      ? Math.max(0, Math.floor((Date.now() - startedAt) / 1000))
+      : 0;
+    await updateStatus(
+      'background',
+      `run_command ${toolCallId} is running in the background (${elapsedSeconds}s). Waiting for completion.`
+    );
+    await new Promise(resolve => setTimeout(resolve, SHELL_JOB_POLL_MS));
+  }
+
+  throw new Error(`Local agent stopped while ${toolCallId} is still running in the background.`);
+}
+
+async function execute(call: ToolCall, callId: string, candidateId: string) {
   const {token} = await chrome.storage.local.get('token');
   if (!token) {
     throw new Error('Open the extension popup and pair with the local daemon first.');
@@ -886,26 +973,32 @@ async function execute(call: ToolCall) {
     || (SHELL_TOOLS.has(call.name) && !policy.shell);
 
   if (needsConfirmation) {
-    await updateStatus('approval', `Waiting for approval to run ${call.name}.`);
+    await updateStatus('approval', `Waiting for approval to run ${call.name} (${callId}).`);
     if (!confirm(`${chatProviderName()} requests local tool: ${call.name}\n${confirmationDetail(call)}\n\nAllow?`)) {
-      return {success: false, error: 'User denied tool call'};
+      return {success: false, pending: false, tool_call_id: callId, error: 'User denied tool call'};
     }
-    await updateStatus('executing', `${call.name} approved. Running locally.`);
+    await updateStatus('executing', `${call.name} approved (${callId}). Running locally.`);
   }
 
-  const response = await fetch('http://127.0.0.1:43121/tool', {
+  const result = await readDaemonResponse(await fetch('http://127.0.0.1:43121/tool', {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      authorization: 'Bearer ' + token
+      authorization: `Bearer ${token}`
     },
-    body: JSON.stringify({name: call.name, arguments: call.arguments || {}})
-  });
+    body: JSON.stringify({name: call.name, arguments: call.arguments || {}, tool_call_id: callId})
+  }));
 
-  const result = await response.json();
-  if (!response.ok) {
-    throw new Error(result.error || `Daemon returned status ${response.status}.`);
+  if (call.name === 'run_command' && result.pending === true) {
+    savePendingShellJob({
+      tool_call_id: callId,
+      candidate_id: candidateId,
+      tool: 'run_command',
+      started_at: String(result.started_at || new Date().toISOString())
+    });
+    return pollShellJob(callId, String(token));
   }
+
   return result;
 }
 
@@ -1188,17 +1281,54 @@ type ToolCandidate = {
   toolName?: string;
 };
 
+function isUserAuthored(element: HTMLElement) {
+  return Boolean(element.closest([
+    '[data-message-author-role="user" i]',
+    '[data-role="user" i]',
+    '[data-author="user" i]',
+    '[data-testid*="user-message" i]',
+    '[class~="user-message" i]'
+  ].join(',')));
+}
+
+function latestRenderedJsonCandidate() {
+  const candidates = new Map<string, ToolCandidate>();
+  const nodes = document.querySelectorAll('pre,code');
+
+  for (const node of nodes) {
+    const element = node as HTMLElement;
+    if (element.closest('form,textarea,[role="textbox"],[contenteditable]:not([contenteditable="false"])')) continue;
+    if (isUserAuthored(element)) continue;
+
+    const text = (element.innerText || element.textContent || '').trim();
+    if (!text) continue;
+
+    const call = parseProviderJsonToolCall(text);
+    if (!call) continue;
+
+    const id = toolCallIdentity(call);
+    candidates.delete(id);
+    candidates.set(id, {id, call});
+  }
+
+  return [...candidates.values()].reverse().find(candidate => !handled.has(candidate.id));
+}
+
 function inferToolName(payload: string) {
   return /["']name["']\s*:\s*["']([A-Za-z_][\w-]*)["']/i.exec(payload)?.[1];
 }
 
 function findToolCandidates() {
+  const renderedJsonCandidate = latestRenderedJsonCandidate();
+  if (renderedJsonCandidate) return [renderedJsonCandidate];
+
   const candidates = new Map<string, ToolCandidate>();
   const nodes = document.querySelectorAll('pre,code,article,div,p,span,tool_call,tool-call');
 
   for (const node of nodes) {
     const element = node as HTMLElement;
     if (element.closest('form,textarea,[role="textbox"],[contenteditable]:not([contenteditable="false"])')) continue;
+    if (isUserAuthored(element)) continue;
 
     const text = (element.innerText || element.textContent || '').trim();
     if (!text) continue;
@@ -1206,6 +1336,7 @@ function findToolCandidates() {
     const renderedJsonCall = parseProviderJsonToolCall(text);
     if (renderedJsonCall) {
       const id = toolCallIdentity(renderedJsonCall);
+      candidates.delete(id);
       candidates.set(id, {id, call: renderedJsonCall});
     }
 
@@ -1214,10 +1345,11 @@ function findToolCandidates() {
       try {
         const call = parseToolBlock(payload);
         const id = toolCallIdentity(call);
-        if (!candidates.has(id)) candidates.set(id, {id, call, repaired: block.repaired});
+        candidates.delete(id);
+        candidates.set(id, {id, call, repaired: block.repaired});
       } catch (error) {
         const id = hash(`tool_block_error:${payload}`);
-        if (candidates.has(id)) continue;
+        candidates.delete(id);
         candidates.set(id, {
           id,
           toolName: inferToolName(payload),
@@ -1230,7 +1362,7 @@ function findToolCandidates() {
       const toolName = match[1];
       const argsPayload = match[2];
       const id = hash(`labeled_tool:${toolName}\n${argsPayload}`);
-      if (candidates.has(id)) continue;
+      candidates.delete(id);
       try {
         candidates.set(id, {
           id,
@@ -1250,13 +1382,20 @@ function findToolCandidates() {
   }
 
   for (const [id, call] of streamedZaiCalls) {
+    candidates.delete(id);
     candidates.set(id, {id, call});
   }
 
-  return [...candidates.values()];
+  const latestCandidate = [...candidates.values()].reverse().find(candidate => !handled.has(candidate.id));
+  return latestCandidate ? [latestCandidate] : [];
 }
 
-async function returnFailureToAI(tool: string, phase: 'parse' | 'execution', error: string) {
+async function returnFailureToAI(
+  tool: string,
+  phase: 'parse' | 'execution',
+  error: string,
+  callId = createToolCallId()
+) {
   if (!agentRunning) return;
   const generation = agentRunGeneration;
   const stillRunning = () => agentRunning && generation === agentRunGeneration;
@@ -1264,6 +1403,7 @@ async function returnFailureToAI(tool: string, phase: 'parse' | 'execution', err
   try {
     await feed({
       tool,
+      tool_call_id: callId,
       success: false,
       phase,
       error,
@@ -1273,12 +1413,67 @@ async function returnFailureToAI(tool: string, phase: 'parse' | 'execution', err
         : 'Review the error and retry with corrected tool arguments if appropriate.'
     });
     if (!stillRunning()) return;
-    await updateStatus('waiting', `Reported the ${phase} failure for ${tool} to ${chatProviderName()}. Waiting for a corrected call.`);
+    await updateStatus(
+      'waiting',
+      `Reported the ${phase} failure for ${tool} (${callId}) to ${chatProviderName()}. Waiting for a corrected call.`
+    );
   } catch (deliveryError) {
     if (!stillRunning()) return;
     const deliveryMessage = (deliveryError as Error).message;
     await updateStatus('error', `${error} Could not return this failure to ${chatProviderName()}: ${deliveryMessage}`);
     console.error('[Local AI Agent] Could not return failure to the chat.', deliveryError);
+  }
+}
+
+async function resumePendingShellJobs() {
+  if (!agentRunning || resumingPendingShellJobs) return;
+
+  const jobs = readPendingShellJobs();
+  for (const job of jobs) handled.add(job.candidate_id);
+  if (!jobs.length) return;
+
+  resumingPendingShellJobs = true;
+  try {
+    const {token} = await chrome.storage.local.get('token');
+    if (!token) {
+      await updateStatus('error', 'Cannot resume background shell jobs until a pairing token is saved.');
+      return;
+    }
+
+    for (const job of jobs) {
+      if (!agentRunning) return;
+
+      let result: Record<string, unknown>;
+      try {
+        result = await pollShellJob(job.tool_call_id, String(token));
+      } catch (error) {
+        if (!agentRunning) return;
+        const message = (error as Error).message;
+        removePendingShellJob(job.tool_call_id);
+        await returnFailureToAI(job.tool, 'execution', message, job.tool_call_id);
+        continue;
+      }
+
+      if (!agentRunning) return;
+      try {
+        await feed({tool: job.tool, ...result});
+        removePendingShellJob(job.tool_call_id);
+        if (!agentRunning) return;
+        await updateStatus(
+          'waiting',
+          `Finished ${job.tool} (${job.tool_call_id}). Waiting for the next <tool_call>.`
+        );
+      } catch (error) {
+        if (!agentRunning) return;
+        await updateStatus(
+          'error',
+          `${job.tool} (${job.tool_call_id}) finished, but its result could not be returned to ${chatProviderName()}: ${(error as Error).message}`
+        );
+        return;
+      }
+    }
+  } finally {
+    resumingPendingShellJobs = false;
   }
 }
 
@@ -1295,12 +1490,13 @@ async function scan() {
     if (handled.has(id)) continue;
     handled.add(id);
     streamedZaiCalls.delete(id);
+    const callId = createToolCallId();
 
     if (candidate.error) {
       toolCallCount += 1;
-      await updateStatus('error', candidate.error);
+      await updateStatus('error', `${candidate.error} Tool call ID: ${callId}.`);
       if (!stillRunning()) return;
-      await returnFailureToAI(candidate.toolName || 'unknown', 'parse', candidate.error);
+      await returnFailureToAI(candidate.toolName || 'unknown', 'parse', candidate.error, callId);
       continue;
     }
 
@@ -1309,16 +1505,17 @@ async function scan() {
 
     toolCallCount += 1;
     const recoveryNote = candidate.repaired ? ' Recovered missing trailing JSON delimiter.' : '';
-    await updateStatus('executing', `Tool call triggered: ${call.name}.${recoveryNote} Running locally.`);
+    await updateStatus('executing', `Tool call triggered: ${call.name} (${callId}).${recoveryNote} Running locally.`);
 
     let result: Record<string, unknown>;
     try {
-      result = await execute(call);
+      result = await execute(call, callId, id);
     } catch (error) {
       if (!stillRunning()) return;
       const message = (error as Error).message;
-      await updateStatus('error', `${call.name} failed: ${message}`);
-      await returnFailureToAI(call.name, 'execution', message);
+      removePendingShellJob(callId);
+      await updateStatus('error', `${call.name} (${callId}) failed: ${message}`);
+      await returnFailureToAI(call.name, 'execution', message, callId);
       console.error('[Local AI Agent]', error);
       continue;
     }
@@ -1326,12 +1523,16 @@ async function scan() {
     if (!stillRunning()) return;
     try {
       await feed({tool: call.name, ...result});
+      removePendingShellJob(callId);
       if (!stillRunning()) return;
-      await updateStatus('waiting', `Finished ${call.name}. Waiting for the next <tool_call>.`);
+      await updateStatus('waiting', `Finished ${call.name} (${callId}). Waiting for the next <tool_call>.`);
     } catch (error) {
       if (!stillRunning()) return;
       const message = (error as Error).message;
-      await updateStatus('error', `${call.name} finished, but its result could not be returned to ${chatProviderName()}: ${message}`);
+      await updateStatus(
+        'error',
+        `${call.name} (${callId}) finished, but its result could not be returned to ${chatProviderName()}: ${message}`
+      );
       console.error('[Local AI Agent]', error);
     }
   }
@@ -1370,6 +1571,8 @@ function installConnectionStorageSync() {
       if (!tabIsPaused() && !agentRunning) {
         setAgentRunning(true);
         await updateStatus('waiting', `Connected to ${projectName(String(activeWorkspace))}. Waiting for a local tool call.`);
+        rememberPendingCandidates();
+        void resumePendingShellJobs();
         queueScan();
       }
     }).catch(() => undefined);
@@ -1389,6 +1592,7 @@ async function init() {
   const activeWorkspace = connection.connectedWorkspace || connection.workspace;
   protocolReinforcementEnabled = !tabIsPaused();
   setAgentRunning(Boolean(connection.token && activeWorkspace) && protocolReinforcementEnabled);
+  rememberPendingCandidates();
   installProtocolReinforcement();
   installZaiStreamBridge();
   installConnectionStorageSync();
@@ -1401,6 +1605,7 @@ async function init() {
 
   if (agentRunning) {
     await updateStatus('waiting', `Connected to ${projectName(String(activeWorkspace))}. Waiting for a local tool call.`);
+    void resumePendingShellJobs();
     queueScan();
   } else {
     const message = connection.token && activeWorkspace

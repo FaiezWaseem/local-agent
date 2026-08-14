@@ -4,6 +4,8 @@ Experimental Chrome extension + localhost Node daemon that gives DeepSeek, Qwen,
 
 ## Features
 - Automatic `<tool_call>` detection with a configurable 3-12 second result cooldown
+- Background `run_command` execution with live elapsed-time polling and resume after tab refresh
+- Unique `tool_call_id` correlation across requests, delayed results, failures, and SQLite history
 - Draggable in-page activity monitor with live tool and send-countdown states
 - Direct Connect and Stop controls in the floating monitor, scoped to the current tab
 - Automatic failure results so the model can correct malformed or failed tool calls
@@ -41,12 +43,13 @@ npm run build:exe
 Share `release/local-ai-agent-windows-x64.exe`. The recipient does not need Node.js, npm, or Bun. Run the executable, keep its console window open, and use the printed pairing token in the extension popup. The popup sets the active project path after connecting.
 
 ## Chat instruction
-DeepSeek, Qwen, and Z.ai receive the strict V3 protocol automatically with every outgoing message. It explicitly disables provider-native tools and requires local calls to be emitted as literal assistant text. The equivalent protocol is:
+DeepSeek, Qwen, and Z.ai receive the strict V4 protocol automatically with every outgoing message. It explicitly disables provider-native tools, requires local calls to be emitted as literal assistant text, and explains delayed shell results. The equivalent protocol is:
 
 ```text
 Never invoke native or built-in provider tools. The only permitted tools are read_file, write_file, edit_file, delete_file, list_directory, run_command, git_status, git_diff, and git_log.
 When local work is required, emit exactly one plain-text `<tool_call>` envelope containing strict JSON shaped as `{"name":"TOOL_NAME","arguments":{}}`, then stop and wait for `<tool_result>`.
 Do not add prose or Markdown fences around a tool call, simulate a result, or merely describe file and shell actions. Paths are relative to the active project. For edit_file use path, old_text, and new_text.
+Each result includes a unique tool_call_id. run_command executes in the background, so wait for its delayed result with the same ID and do not repeat the command while it is pending.
 ```
 
 Then ask: `Inspect this project and explain its structure.`
@@ -55,4 +58,4 @@ Then ask: `Inspect this project and explain its structure.`
 Auto-approval is opt-in and disabled by default. Auto-approved shell commands still pass through the daemon's high-risk command blocklist. Keep the daemon on 127.0.0.1 and do not expose port 43121 publicly. Each supported chat DOM is third-party UI and can change; `extension/src/content.ts` isolates the adapter logic.
 
 ## Known limitation
-Auto-submit is DOM-based. If a supported chat changes its composer/send-button implementation, tool execution still works but the adapter may need a selector/event update.
+Auto-submit is DOM-based. If a supported chat changes its composer/send-button implementation, tool execution still works but the adapter may need a selector/event update. Background job state survives a chat-tab refresh but remains in daemon memory, so restarting the daemon while a command is running loses that job.

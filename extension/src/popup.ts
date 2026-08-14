@@ -29,7 +29,8 @@ const EMPTY_POLICY: ApprovalPolicy = {edits: false, deletes: false, shell: false
 const INITIAL_PROMPT = [
   'Never invoke native or built-in provider tools. The only permitted tools are read_file, write_file, edit_file, delete_file, list_directory, run_command, git_status, git_diff, and git_log.',
   'When local work is required, emit exactly one plain-text `<tool_call>` envelope containing strict JSON shaped as `{"name":"TOOL_NAME","arguments":{}}`, then stop and wait for `<tool_result>`.',
-  'Do not add prose or Markdown fences around a tool call, simulate a result, or merely describe file and shell actions. Paths are relative to the active project. For edit_file use path, old_text, and new_text.'
+  'Do not add prose or Markdown fences around a tool call, simulate a result, or merely describe file and shell actions. Paths are relative to the active project. For edit_file use path, old_text, and new_text.',
+  'Each result includes a unique tool_call_id. run_command executes in the background, so wait for its delayed result with the same ID and do not repeat the command while it is pending.'
 ].join('\n');
 const $ = <T extends HTMLElement>(selector: string) => document.querySelector(selector) as T;
 
@@ -119,7 +120,9 @@ function formatAgentStatus(agentStatus?: AgentStatus) {
 
 function statusTone(agentStatus?: AgentStatus): StatusTone {
   if (agentStatus?.state === 'error') return 'error';
-  if (['detected', 'approval', 'executing', 'cooldown', 'sending'].includes(agentStatus?.state || '')) return 'busy';
+  if (['detected', 'approval', 'executing', 'background', 'cooldown', 'sending'].includes(agentStatus?.state || '')) {
+    return 'busy';
+  }
   if (agentStatus?.state === 'stopped') return 'neutral';
   if (agentStatus) return 'success';
   return 'neutral';

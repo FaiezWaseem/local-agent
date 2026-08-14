@@ -4,6 +4,11 @@ import {safePath} from '../security/workspace.js';
 const blocked = /\b(sudo|su|shutdown|reboot|mkfs|fdisk|mount|umount)\b|rm\s+-rf\s+(\/|~)/i;
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+const MAX_OUTPUT_CHARS = 200000;
+
+function appendOutput(current: string, data: unknown) {
+  return (current + String(data)).slice(-MAX_OUTPUT_CHARS);
+}
 
 export function shell(root: string, args: any) {
   return new Promise((resolve, reject) => {
@@ -17,7 +22,7 @@ export function shell(root: string, args: any) {
       ? Math.min(MAX_TIMEOUT_MS, Math.max(1000, requestedTimeout))
       : DEFAULT_TIMEOUT_MS;
     const startedAt = Date.now();
-    const process = spawn(command, {cwd, shell: true, env: processEnv()});
+    const child = spawn(command, {cwd, shell: true, env: process.env});
     let stdout = '';
     let stderr = '';
     let timedOut = false;
@@ -25,36 +30,32 @@ export function shell(root: string, args: any) {
 
     const timer = setTimeout(() => {
       timedOut = true;
-      process.kill('SIGTERM');
+      child.kill('SIGTERM');
     }, timeoutMs);
 
-    process.stdout.on('data', data => {
-      stdout += data;
+    child.stdout.on('data', data => {
+      stdout = appendOutput(stdout, data);
     });
-    process.stderr.on('data', data => {
-      stderr += data;
+    child.stderr.on('data', data => {
+      stderr = appendOutput(stderr, data);
     });
-    process.on('error', error => {
+    child.on('error', error => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       reject(error);
     });
-    process.on('close', code => {
+    child.on('close', code => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       resolve({
         code,
-        stdout: stdout.slice(-200000),
-        stderr: stderr.slice(-200000),
+        stdout,
+        stderr,
         timed_out: timedOut,
         duration_ms: Date.now() - startedAt
       });
     });
   });
-}
-
-function processEnv() {
-  return process.env;
 }
