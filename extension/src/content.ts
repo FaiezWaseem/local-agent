@@ -78,6 +78,29 @@ type PendingShellJob = {
   command?: string;
 };
 
+type BridgeChatMessage = {
+  role: string;
+  content: string | Array<{type?: string; text?: string}>;
+};
+
+type BridgeServerMessage = {
+  type?: string;
+  request_id?: string;
+  model?: string;
+  messages?: BridgeChatMessage[];
+  provider?: string;
+  error?: string;
+};
+
+type ActiveBridgeCompletion = {
+  id: string;
+  model: string;
+  sequence: number;
+  content: string;
+  finalAnswer: string;
+  streamStarted: boolean;
+};
+
 const TOOL_BLOCK_OPEN = '<tool_call>';
 const TOOL_BLOCK_CLOSE = '</tool_call>';
 const LABELED_TOOL_RE = /(?:^|\n)\s*(?:\*\*)?Call Tool:(?:\*\*)?\s*([A-Za-z_][\w-]*)\s*(?:\n|$)\s*(?:\*\*)?Arguments:(?:\*\*)?\s*([\s\S]*?)(?=(?:\n\s*(?:\*\*)?Call Tool:)|$)/gi;
@@ -86,7 +109,14 @@ const CHAT_PROVIDER_NAMES: Record<string, string> = {
   'chat.qwen.ai': 'Qwen',
   'chat.z.ai': 'Z.ai'
 };
+const DEEPSEEK_STREAM_EVENT = 'local-ai-agent:deepseek-answer';
 const ZAI_STREAM_EVENT = 'local-ai-agent:zai-answer';
+const PROVIDER_STREAM_STATE_EVENT = 'local-ai-agent:provider-stream-state';
+const PROVIDER_STREAM_DELTA_EVENT = 'local-ai-agent:provider-stream-delta';
+const COMPLETION_BRIDGE_URL = 'ws://127.0.0.1:43121/ws/extension';
+const COMPLETION_BRIDGE_PROTOCOL = 'local-ai-agent';
+const COMPLETION_BRIDGE_CLIENT_KEY = 'local-ai-agent-completion-bridge-client';
+const COMPLETION_BRIDGE_RECONNECT_MAX_MS = 15_000;
 const TAB_PAUSED_KEY = 'local-ai-agent-paused';
 const PENDING_SHELL_JOBS_KEY = 'local-ai-agent-pending-shell-jobs';
 const SHELL_JOB_POLL_MS = 2000;
@@ -145,7 +175,7 @@ const EDIT_TOOLS = new Set(['write_file', 'edit_file']);
 const DELETE_TOOLS = new Set(['delete_file']);
 const SHELL_TOOLS = new Set(['run_command']);
 const handled = new Set<string>();
-const streamedZaiCalls = new Map<string, ToolCall>();
+const streamedProviderCalls = new Map<string, ToolCall>();
 const streamedDomSuppressions = new Set<string>();
 const agentWindow = window as AgentWindow;
 let scanQueued = false;
@@ -161,9 +191,22 @@ let protocolReinforcementEnabled = true;
 let resumingPendingShellJobs = false;
 let activeTool: ActiveTool | null = null;
 let streamedCallSequence = 0;
+let providerResponseDepth = 0;
+let completionBridgeSocket: WebSocket | null = null;
+let completionBridgeReconnectTimer = 0;
+let completionBridgeHeartbeatTimer = 0;
+let completionBridgeReconnectAttempt = 0;
+let activeBridgeCompletion: ActiveBridgeCompletion | null = null;
+let bridgeResponseSuppressionActive = false;
 
 function chatProviderName() {
   return CHAT_PROVIDER_NAMES[location.hostname] || 'AI chat';
+}
+
+function completionBridgeProvider() {
+  if (location.hostname === 'chat.deepseek.com') return 'deepseek';
+  if (location.hostname === 'chat.z.ai') return 'zai';
+  return undefined;
 }
 
 function shouldReinforceProtocol() {
@@ -189,6 +232,7 @@ function statusLabel(state: string) {
     background: 'Background job',
     cooldown: 'Cooling down',
     sending: 'Sending result',
+    generating: 'AI responding',
     waiting: 'Waiting',
     connecting: 'Connecting',
     stopped: 'Stopped',
@@ -1123,9 +1167,14 @@ function parseProviderJsonToolCall(payload: string) {
   try {
     parsed = JSON.parse(stripCodeFence(payload)) as Record<string, unknown>;
   } catch {
-    const recovered = recoverRenderedTextToolCall(payload);
-    if (!recovered) return null;
-    parsed = recovered as unknown as Record<string, unknown>;
+    try {
+      const recovered = recoverRenderedTextToolCall(payload);
+      if (!recovered) return null;
+      parsed = recovered as unknown as Record<string, unknown>;
+    } catch {
+      // Enveloped edit/write calls are recovered after their <tool_call> block is extracted.
+      return null;
+    }
   }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
   if (Object.keys(parsed).sort().join(',') !== 'arguments,name') return null;
@@ -1137,20 +1186,98 @@ function parseProviderJsonToolCall(payload: string) {
   } satisfies ToolCall;
 }
 
-function installZaiStreamBridge() {
-  if (location.hostname !== 'chat.z.ai') return;
+function parseStreamedToolCall(answer: string) {
+  let providerCall: ToolCall | null = null;
+  try {
+    providerCall = parseProviderJsonToolCall(answer);
+  } catch {
+    // A provider-level parse must never prevent the envelope parser from running.
+  }
+  if (providerCall) return providerCall;
 
-  document.addEventListener(ZAI_STREAM_EVENT, event => {
+  const blocks = extractToolBlocks(answer);
+  for (let index = blocks.length - 1; index >= 0; index -= 1) {
+    const {payload, rawPayload} = blocks[index];
+    try {
+      return parseToolBlock(payload);
+    } catch {
+      try {
+        return parseToolBlock(rawPayload);
+      } catch {
+        // A malformed stream call will still be reported by the DOM scanner.
+      }
+    }
+  }
+
+  return null;
+}
+
+function installProviderStreamBridge() {
+  const streamEvent = location.hostname === 'chat.deepseek.com'
+    ? DEEPSEEK_STREAM_EVENT
+    : location.hostname === 'chat.z.ai'
+      ? ZAI_STREAM_EVENT
+      : undefined;
+  if (!streamEvent) return;
+
+  document.addEventListener(PROVIDER_STREAM_STATE_EVENT, event => {
+    const state = (event as CustomEvent<unknown>).detail;
+    if (state === 'started') {
+      providerResponseDepth += 1;
+      if (activeBridgeCompletion) activeBridgeCompletion.streamStarted = true;
+      if (agentRunning) {
+        const message = activeBridgeCompletion
+          ? `${chatProviderName()} is streaming API completion ${activeBridgeCompletion.id}.`
+          : `${chatProviderName()} is generating a response. Local actions are paused.`;
+        void updateStatus('generating', message);
+      }
+      return;
+    }
+
+    if (state === 'finished') {
+      providerResponseDepth = Math.max(0, providerResponseDepth - 1);
+      if (activeBridgeCompletion?.streamStarted) {
+        void finishBridgeCompletion();
+        return;
+      }
+      if (providerResponseDepth === 0) {
+        if (agentRunning) {
+          void updateStatus('waiting', `${chatProviderName()} finished responding. Checking for a local tool call.`);
+        }
+        queueScan();
+      }
+    }
+  });
+
+  document.addEventListener(PROVIDER_STREAM_DELTA_EVENT, event => {
+    const delta = (event as CustomEvent<unknown>).detail;
+    if (!activeBridgeCompletion?.streamStarted || typeof delta !== 'string' || !delta) return;
+    activeBridgeCompletion.content += delta;
+    activeBridgeCompletion.sequence += 1;
+    sendCompletionBridgeMessage({
+      type: 'completion.delta',
+      request_id: activeBridgeCompletion.id,
+      sequence: activeBridgeCompletion.sequence,
+      delta
+    });
+  });
+
+  document.addEventListener(streamEvent, event => {
     if (!agentRunning) return;
     const answer = (event as CustomEvent<unknown>).detail;
     if (typeof answer !== 'string') return;
 
-    const call = parseProviderJsonToolCall(answer);
+    if (activeBridgeCompletion?.streamStarted) {
+      activeBridgeCompletion.finalAnswer = answer;
+      return;
+    }
+
+    const call = parseStreamedToolCall(answer);
     if (!call) return;
 
     const baseId = toolCallIdentity(call);
     const id = `stream:${++streamedCallSequence}:${baseId}`;
-    streamedZaiCalls.set(id, call);
+    streamedProviderCalls.set(id, call);
     queueScan();
   });
 }
@@ -1293,6 +1420,22 @@ async function readDaemonResponse(response: Response) {
   return body;
 }
 
+function extensionContextWasInvalidated(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /extension context (?:has been )?invalidated|context invalidated/i.test(message);
+}
+
+function reloadInvalidatedExtensionTab() {
+  setAgentRunning(false);
+  renderIndicator({
+    state: 'error',
+    message: 'The extension was updated. Reloading this chat tab to attach the new version...',
+    url: location.href,
+    ts: Date.now()
+  });
+  window.setTimeout(() => location.reload(), 750);
+}
+
 async function connectAgent() {
   if (agentRunning || indicatorControlsBusy) return;
 
@@ -1337,8 +1480,13 @@ async function connectAgent() {
     await updateStatus('waiting', `Connected to ${projectName(connectedWorkspace)}. Waiting for a local tool call.`);
     rememberPendingCandidates();
     void resumePendingShellJobs();
+    void openCompletionBridge();
     queueScan();
   } catch (error) {
+    if (extensionContextWasInvalidated(error)) {
+      reloadInvalidatedExtensionTab();
+      return;
+    }
     setAgentRunning(false);
     await updateStatus('error', `Connection failed: ${(error as Error).message}`);
   } finally {
@@ -1353,7 +1501,8 @@ async function stopAgent() {
   setTabPaused(true);
   protocolReinforcementEnabled = false;
   setAgentRunning(false);
-  streamedZaiCalls.clear();
+  closeCompletionBridge();
+  streamedProviderCalls.clear();
   streamedDomSuppressions.clear();
   protocolReinforcementPending = false;
   protocolSendReplay = false;
@@ -1531,6 +1680,42 @@ function resultIsPending() {
   return Boolean(composer && composerText(composer).includes('<tool_result>'));
 }
 
+function findProviderStopControl() {
+  const controls = [...document.querySelectorAll<HTMLElement>('button,[role="button"]')];
+  return controls.find(control => {
+    if (!isVisible(control)) return false;
+    const label = controlLabel(control).trim();
+    return /^(?:(?:stop|cancel)\s*)+$/i.test(label)
+      || /\b(stop|cancel)\s+(generating|generation|response)\b/i.test(label);
+  }) || null;
+}
+
+function providerUiIsGenerating() {
+  return Boolean(findProviderStopControl());
+}
+
+function providerResponseIsGenerating() {
+  return providerResponseDepth > 0 || providerUiIsGenerating();
+}
+
+async function waitForProviderResponse(generation = agentRunGeneration) {
+  let announced = false;
+  while (agentRunning && generation === agentRunGeneration && providerResponseIsGenerating()) {
+    if (!announced) {
+      announced = true;
+      await updateStatus(
+        'generating',
+        `${chatProviderName()} is still generating. The pending local-agent message will wait.`
+      );
+    }
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+
+  if (!agentRunning || generation !== agentRunGeneration) {
+    throw new Error('Local agent stopped while waiting for the AI response to finish.');
+  }
+}
+
 function isClickable(element: HTMLElement) {
   if (!isVisible(element)) return false;
   if (element.getAttribute('aria-disabled') === 'true') return false;
@@ -1580,6 +1765,272 @@ function pressEnter(composer: HTMLElement) {
   composer.dispatchEvent(new KeyboardEvent('keyup', eventOptions));
 }
 
+function completionBridgeClientId() {
+  try {
+    const existing = sessionStorage.getItem(COMPLETION_BRIDGE_CLIENT_KEY);
+    if (existing) return existing;
+    const created = `tab_${crypto.randomUUID()}`;
+    sessionStorage.setItem(COMPLETION_BRIDGE_CLIENT_KEY, created);
+    return created;
+  } catch {
+    return `tab_${crypto.randomUUID()}`;
+  }
+}
+
+function sendCompletionBridgeMessage(message: Record<string, unknown>) {
+  if (completionBridgeSocket?.readyState !== WebSocket.OPEN) return false;
+  try {
+    completionBridgeSocket.send(JSON.stringify(message));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function clearCompletionBridgeTimers() {
+  if (completionBridgeReconnectTimer) window.clearTimeout(completionBridgeReconnectTimer);
+  if (completionBridgeHeartbeatTimer) window.clearInterval(completionBridgeHeartbeatTimer);
+  completionBridgeReconnectTimer = 0;
+  completionBridgeHeartbeatTimer = 0;
+}
+
+function scheduleCompletionBridgeReconnect() {
+  if (!agentRunning || !completionBridgeProvider() || completionBridgeReconnectTimer) return;
+  const delay = Math.min(COMPLETION_BRIDGE_RECONNECT_MAX_MS, 500 * (2 ** completionBridgeReconnectAttempt));
+  completionBridgeReconnectAttempt += 1;
+  completionBridgeReconnectTimer = window.setTimeout(() => {
+    completionBridgeReconnectTimer = 0;
+    void openCompletionBridge();
+  }, delay);
+}
+
+function cancelActiveBridgeCompletion(message = 'Completion bridge disconnected.') {
+  const completion = activeBridgeCompletion;
+  if (!completion) return;
+  activeBridgeCompletion = null;
+  findProviderStopControl()?.click();
+  void suppressCompletedBridgeResponse();
+  if (agentRunning) void updateStatus('error', `${message} Request ${completion.id} was cancelled.`);
+}
+
+function closeCompletionBridge() {
+  clearCompletionBridgeTimers();
+  const socket = completionBridgeSocket;
+  completionBridgeSocket = null;
+  if (socket && socket.readyState < WebSocket.CLOSING) socket.close(1000, 'Local agent stopped');
+  cancelActiveBridgeCompletion('Completion bridge closed.');
+}
+
+function bridgeMessageText(message: BridgeChatMessage) {
+  if (typeof message.content === 'string') return message.content;
+  return message.content
+    .filter(part => part.type === 'text' && typeof part.text === 'string')
+    .map(part => part.text)
+    .join('\n');
+}
+
+function completionPrompt(messages: BridgeChatMessage[]) {
+  const normalized = messages
+    .map(message => ({role: message.role.toUpperCase(), content: bridgeMessageText(message)}))
+    .filter(message => message.content.trim());
+  if (normalized.length === 1 && normalized[0].role === 'USER') return normalized[0].content;
+
+  return [
+    'Continue the conversation below and answer the final user message. Treat SYSTEM and DEVELOPER entries as instructions.',
+    '',
+    ...normalized.flatMap(message => [`[${message.role}]`, message.content, ''])
+  ].join('\n').trimEnd();
+}
+
+async function bridgeSubmissionObserved(composer: HTMLElement, prompt: string, timeoutMs: number) {
+  const expiresAt = Date.now() + timeoutMs;
+  while (Date.now() < expiresAt) {
+    if (providerResponseIsGenerating()) return true;
+    if (composerText(composer).trim() !== prompt.trim()) return true;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  return false;
+}
+
+async function submitBridgePrompt(prompt: string) {
+  const composer = findComposer();
+  if (!composer) throw new Error(`${chatProviderName()} composer was not found.`);
+  setComposer(composer, prompt);
+  protocolSendReplay = true;
+
+  try {
+    pressEnter(composer);
+    if (await bridgeSubmissionObserved(composer, prompt, 800)) return;
+
+    const sendControl = findSendControl(composer);
+    if (sendControl) {
+      sendControl.click();
+      if (await bridgeSubmissionObserved(composer, prompt, 800)) return;
+    }
+
+    const form = composer.closest('form');
+    if (form) {
+      form.requestSubmit();
+      if (await bridgeSubmissionObserved(composer, prompt, 800)) return;
+    }
+  } finally {
+    protocolSendReplay = false;
+  }
+
+  throw new Error(`Could not submit the completion prompt through the ${chatProviderName()} UI.`);
+}
+
+async function waitForBridgeStream(requestId: string) {
+  const expiresAt = Date.now() + 30_000;
+  while (Date.now() < expiresAt) {
+    if (activeBridgeCompletion?.id !== requestId) return;
+    if (activeBridgeCompletion.streamStarted) return;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  throw new Error(`${chatProviderName()} did not start a completion stream within 30 seconds.`);
+}
+
+async function handleBridgeCompletionRequest(message: BridgeServerMessage) {
+  const requestId = String(message.request_id || '');
+  const messages = Array.isArray(message.messages) ? message.messages : [];
+  if (!requestId || !messages.length) return;
+
+  if (!agentRunning || activeBridgeCompletion || activeTool || providerResponseIsGenerating()
+    || bridgeResponseSuppressionActive || resultIsPending()) {
+    sendCompletionBridgeMessage({
+      type: 'completion.error',
+      request_id: requestId,
+      error: `${chatProviderName()} tab is busy with another local or provider operation.`
+    });
+    return;
+  }
+
+  activeBridgeCompletion = {
+    id: requestId,
+    model: String(message.model || `${completionBridgeProvider()}-web`),
+    sequence: -1,
+    content: '',
+    finalAnswer: '',
+    streamStarted: false
+  };
+  sendCompletionBridgeMessage({type: 'completion.accepted', request_id: requestId});
+
+  try {
+    await updateStatus('sending', `Submitting API completion ${requestId} to ${chatProviderName()}.`);
+    const prompt = completionPrompt(messages);
+    if (!prompt.trim()) throw new Error('The completion request does not contain any supported text content.');
+    await submitBridgePrompt(prompt);
+    await waitForBridgeStream(requestId);
+  } catch (error) {
+    if (activeBridgeCompletion?.id !== requestId) return;
+    activeBridgeCompletion = null;
+    sendCompletionBridgeMessage({
+      type: 'completion.error',
+      request_id: requestId,
+      error: (error as Error).message
+    });
+    await updateStatus('error', `API completion ${requestId} failed: ${(error as Error).message}`);
+  }
+}
+
+async function suppressCompletedBridgeResponse() {
+  if (bridgeResponseSuppressionActive) {
+    while (bridgeResponseSuppressionActive) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    return;
+  }
+  bridgeResponseSuppressionActive = true;
+  try {
+    await new Promise(resolve => setTimeout(resolve, 500));
+    for (const candidate of findToolCandidates()) {
+      handled.add(candidate.id);
+      streamedProviderCalls.delete(candidate.id);
+    }
+  } finally {
+    bridgeResponseSuppressionActive = false;
+  }
+}
+
+async function finishBridgeCompletion() {
+  const completion = activeBridgeCompletion;
+  if (!completion) return;
+  const content = completion.finalAnswer || completion.content;
+  const toolCall = parseStreamedToolCall(content);
+  if (toolCall) streamedDomSuppressions.add(toolCallIdentity(toolCall));
+  await suppressCompletedBridgeResponse();
+  if (activeBridgeCompletion?.id !== completion.id) return;
+  activeBridgeCompletion = null;
+  sendCompletionBridgeMessage({
+    type: 'completion.completed',
+    request_id: completion.id,
+    content,
+    finish_reason: 'stop'
+  });
+  if (agentRunning) {
+    await updateStatus('waiting', `API completion ${completion.id} finished. Waiting for a local tool call.`);
+  }
+}
+
+function handleCompletionBridgeMessage(event: MessageEvent<string>) {
+  let message: BridgeServerMessage;
+  try {
+    message = JSON.parse(String(event.data)) as BridgeServerMessage;
+  } catch {
+    return;
+  }
+
+  if (message.type === 'completion.request') {
+    void handleBridgeCompletionRequest(message);
+  } else if (message.type === 'completion.cancel' && message.request_id === activeBridgeCompletion?.id) {
+    cancelActiveBridgeCompletion('API client cancelled the completion.');
+  }
+}
+
+async function openCompletionBridge() {
+  const provider = completionBridgeProvider();
+  if (!agentRunning || !provider) return;
+  if (completionBridgeSocket && completionBridgeSocket.readyState <= WebSocket.OPEN) return;
+
+  const {token} = await chrome.storage.local.get('token');
+  const pairingToken = String(token || '').trim();
+  if (!pairingToken || !agentRunning) return;
+
+  clearCompletionBridgeTimers();
+  let socket: WebSocket;
+  try {
+    socket = new WebSocket(COMPLETION_BRIDGE_URL, [COMPLETION_BRIDGE_PROTOCOL, `token.${pairingToken}`]);
+  } catch {
+    scheduleCompletionBridgeReconnect();
+    return;
+  }
+  completionBridgeSocket = socket;
+
+  socket.addEventListener('open', () => {
+    if (completionBridgeSocket !== socket) return;
+    completionBridgeReconnectAttempt = 0;
+    sendCompletionBridgeMessage({
+      type: 'bridge.register',
+      client_id: completionBridgeClientId(),
+      provider,
+      url: location.href
+    });
+    completionBridgeHeartbeatTimer = window.setInterval(() => {
+      sendCompletionBridgeMessage({type: 'bridge.ping', ts: Date.now()});
+    }, 20_000);
+  });
+
+  socket.addEventListener('message', handleCompletionBridgeMessage as EventListener);
+  socket.addEventListener('close', () => {
+    if (completionBridgeSocket !== socket) return;
+    completionBridgeSocket = null;
+    if (completionBridgeHeartbeatTimer) window.clearInterval(completionBridgeHeartbeatTimer);
+    completionBridgeHeartbeatTimer = 0;
+    cancelActiveBridgeCompletion();
+    scheduleCompletionBridgeReconnect();
+  });
+}
+
 async function reinforceComposerAndReplay(composer: HTMLElement, replay: () => void) {
   if (!protocolReinforcementEnabled || protocolSendReplay || protocolReinforcementPending) return;
   const generation = agentRunGeneration;
@@ -1619,6 +2070,12 @@ function installProtocolReinforcement() {
     const composer = findComposer();
     const target = event.target as Node | null;
     if (!composer || !target || (target !== composer && !composer.contains(target))) return;
+    if (!protocolSendReplay && (providerResponseIsGenerating() || activeBridgeCompletion || bridgeResponseSuppressionActive)) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      void updateStatus('generating', `Wait for ${chatProviderName()} to finish before sending another message.`);
+      return;
+    }
     if (protocolSendReplay) return;
     if (protocolReinforcementPending) {
       event.preventDefault();
@@ -1640,6 +2097,12 @@ function installProtocolReinforcement() {
 
     const sendControl = findSendControl(composer);
     if (!sendControl || (target !== sendControl && !sendControl.contains(target))) return;
+    if (!protocolSendReplay && (providerResponseIsGenerating() || activeBridgeCompletion || bridgeResponseSuppressionActive)) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      void updateStatus('generating', `Wait for ${chatProviderName()} to finish before sending another message.`);
+      return;
+    }
     if (protocolSendReplay) return;
     if (protocolReinforcementPending) {
       event.preventDefault();
@@ -1658,6 +2121,12 @@ function installProtocolReinforcement() {
     const composer = findComposer();
     const form = event.target as HTMLFormElement;
     if (!composer || composer.closest('form') !== form) return;
+    if (!protocolSendReplay && (providerResponseIsGenerating() || activeBridgeCompletion || bridgeResponseSuppressionActive)) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      void updateStatus('generating', `Wait for ${chatProviderName()} to finish before sending another message.`);
+      return;
+    }
     if (protocolSendReplay) return;
     if (protocolReinforcementPending) {
       event.preventDefault();
@@ -1698,6 +2167,7 @@ async function submitResult(delayMs: number) {
   }
 
   if (!stillRunning()) return false;
+  await waitForProviderResponse(generation);
   await updateStatus('sending', `Sending the tool result to ${chatProviderName()} now.`);
 
   let composer = findComposer();
@@ -1706,17 +2176,21 @@ async function submitResult(delayMs: number) {
   pressEnter(composer);
   await new Promise(resolve => setTimeout(resolve, 450));
   if (!stillRunning()) return false;
+  if (providerResponseIsGenerating()) return true;
   if (!resultIsPending()) return true;
 
+  await waitForProviderResponse(generation);
   composer = findComposer();
   const sendControl = composer && findSendControl(composer);
   if (sendControl) {
     sendControl.click();
     await new Promise(resolve => setTimeout(resolve, 450));
     if (!stillRunning()) return false;
+    if (providerResponseIsGenerating()) return true;
     if (!resultIsPending()) return true;
   }
 
+  await waitForProviderResponse(generation);
   composer = findComposer();
   const form = composer?.closest('form');
   if (form) {
@@ -1729,6 +2203,7 @@ async function submitResult(delayMs: number) {
 
 async function feed(result: unknown) {
   if (!agentRunning) throw new Error('Local agent is stopped on this tab.');
+  await waitForProviderResponse();
   const text = withReinforcedProtocol(
     `<tool_result>\n${JSON.stringify(result)}\n</tool_result>\nContinue the original task using the required local-agent protocol.`
   );
@@ -1861,8 +2336,8 @@ function inferToolName(payload: string) {
   return /["']name["']\s*:\s*["']([A-Za-z_][\w-]*)["']/i.exec(payload)?.[1];
 }
 
-function findToolCandidates() {
-  const latestStream = [...streamedZaiCalls.entries()].at(-1);
+function findToolCandidates(): ToolCandidate[] {
+  const latestStream = [...streamedProviderCalls.entries()].at(-1);
   if (latestStream) {
     const [id, call] = latestStream;
     if (!handled.has(id)) {
@@ -2057,7 +2532,7 @@ async function resumePendingShellJobs() {
 }
 
 async function scan() {
-  if (!agentRunning) return;
+  if (!agentRunning || providerResponseIsGenerating() || activeBridgeCompletion || bridgeResponseSuppressionActive) return;
   const generation = agentRunGeneration;
   const stillRunning = () => agentRunning && generation === agentRunGeneration;
   const candidates = findToolCandidates();
@@ -2069,7 +2544,7 @@ async function scan() {
     if (handled.has(id)) continue;
     handled.add(id);
     if (candidate.source === 'stream') streamedDomSuppressions.add(candidate.baseId);
-    streamedZaiCalls.delete(id);
+    streamedProviderCalls.delete(id);
     const callId = createToolCallId();
 
     if (candidate.error) {
@@ -2123,11 +2598,11 @@ async function scan() {
 }
 
 function queueScan() {
-  if (!agentRunning || scanQueued) return;
+  if (!agentRunning || providerResponseIsGenerating() || activeBridgeCompletion || bridgeResponseSuppressionActive || scanQueued) return;
   scanQueued = true;
   window.setTimeout(() => {
     scanQueued = false;
-    if (agentRunning) void scan();
+    if (agentRunning && !providerResponseIsGenerating() && !activeBridgeCompletion && !bridgeResponseSuppressionActive) void scan();
   }, 150);
 }
 
@@ -2145,6 +2620,7 @@ function installConnectionStorageSync() {
       const activeWorkspace = values.connectedWorkspace || values.workspace;
       const hasConnection = Boolean(values.token && activeWorkspace);
       if (!hasConnection) {
+        closeCompletionBridge();
         if (agentRunning) {
           setAgentRunning(false);
           await updateStatus('stopped', 'Connection settings were removed. Connect after saving them again.');
@@ -2157,7 +2633,11 @@ function installConnectionStorageSync() {
         await updateStatus('waiting', `Connected to ${projectName(String(activeWorkspace))}. Waiting for a local tool call.`);
         rememberPendingCandidates();
         void resumePendingShellJobs();
+        void openCompletionBridge();
         queueScan();
+      } else if (agentRunning && changes.token) {
+        closeCompletionBridge();
+        void openCompletionBridge();
       }
     }).catch(() => undefined);
   });
@@ -2178,7 +2658,7 @@ async function init() {
   setAgentRunning(Boolean(connection.token && activeWorkspace) && protocolReinforcementEnabled);
   rememberPendingCandidates();
   installProtocolReinforcement();
-  installZaiStreamBridge();
+  installProviderStreamBridge();
   installConnectionStorageSync();
 
   new MutationObserver(() => queueScan()).observe(document.documentElement, {
@@ -2190,6 +2670,7 @@ async function init() {
   if (agentRunning) {
     await updateStatus('waiting', `Connected to ${projectName(String(activeWorkspace))}. Waiting for a local tool call.`);
     void resumePendingShellJobs();
+    void openCompletionBridge();
     queueScan();
   } else {
     const message = connection.token && activeWorkspace

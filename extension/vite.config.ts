@@ -12,6 +12,7 @@ export default defineConfig({
     rollupOptions: {
       input: {
         content: resolve(rootDir, 'src/content.ts'),
+        'deepseek-stream': resolve(rootDir, 'src/deepseek-stream.ts'),
         'zai-stream': resolve(rootDir, 'src/zai-stream.ts'),
         popup: resolve(rootDir, 'popup.html')
       },

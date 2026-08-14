@@ -22,6 +22,9 @@ Experimental Chrome extension + localhost Node daemon that gives DeepSeek, Qwen,
 - `run_command`, `git_status`, `git_diff`, `git_log`
 - SQLite tool-call history at `~/.deepseek-local/history.db`
 - Compact human-readable daemon request logs with tool names, safe argument summaries, status, and timing
+- OpenAI-compatible `/v1/chat/completions` streaming and non-streaming API routed through a connected browser tab
+- Authenticated extension WebSocket bridge with per-request correlation, cancellation, timeout, and one-request-per-tab locking
+- Sanitized real-time `/v1/events` SSE diagnostics, with opt-in response delta content
 - Blocks obvious high-risk system commands
 
 ## Install
@@ -57,8 +60,38 @@ Each result includes a unique tool_call_id. run_command executes in the backgrou
 
 Then ask: `Inspect this project and explain its structure.`
 
+## OpenAI-compatible API
+
+Keep a connected DeepSeek or Z.ai chat tab open. Use the daemon URL as the OpenAI base URL and the printed pairing token as the API key:
+
+```text
+Base URL: http://127.0.0.1:43121/v1
+API key:  <pairing token>
+Models:   deepseek-web, glm-web, auto
+```
+
+Streaming example:
+
+```bash
+curl -N http://127.0.0.1:43121/v1/chat/completions \
+  -H "Authorization: Bearer <pairing token>" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-web","stream":true,"messages":[{"role":"user","content":"Explain this project briefly."}]}'
+```
+
+The daemon sends each request over an authenticated localhost WebSocket to an idle matching provider tab. The extension submits the conversation through the provider UI and returns normalized OpenAI `chat.completion.chunk` events followed by `data: [DONE]`. Only DeepSeek and Z.ai currently expose direct response streams; Qwen remains available for local tools but is not advertised by `/v1/models`.
+
+Real-time diagnostic events are available with the same bearer token:
+
+```bash
+curl -N http://127.0.0.1:43121/v1/events \
+  -H "Authorization: Bearer <pairing token>"
+```
+
+Diagnostics omit prompt and response content by default. Add `?include_content=1` only when full response deltas are needed for local debugging.
+
 ## Safety
 Auto-approval is opt-in and disabled by default. Auto-approved shell commands still pass through the daemon's high-risk command blocklist. Keep the daemon on 127.0.0.1 and do not expose port 43121 publicly. Each supported chat DOM is third-party UI and can change; `extension/src/content.ts` isolates the adapter logic.
 
 ## Known limitation
-Auto-submit is DOM-based. If a supported chat changes its composer/send-button implementation, tool execution still works but the adapter may need a selector/event update. Background job state survives a chat-tab refresh but remains in daemon memory, so restarting the daemon while a command is running loses that job.
+Auto-submit is DOM-based. If a supported chat changes its composer/send-button implementation, tool execution still works but the adapter may need a selector/event update. Background job state survives a chat-tab refresh but remains in daemon memory, so restarting the daemon while a command is running loses that job. Node detects abandoned completion streams immediately; the portable Bun executable may rely on the configured completion timeout when its HTTP compatibility layer does not surface a client disconnect.

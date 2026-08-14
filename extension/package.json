@@ -1,1 +1,1 @@
-{"name":"extension","type":"module","scripts":{"build":"vite build"},"devDependencies":{"@types/chrome":"latest","typescript":"latest","vite":"latest"}}
+{"name":"extension","type":"module","scripts":{"build":"vite build","test:parser":"node tests/parser-regression.mjs","test:streams":"vite build && node tests/stream-regression.mjs"},"devDependencies":{"@types/chrome":"latest","typescript":"latest","vite":"latest"}}

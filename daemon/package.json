@@ -1,1 +1,25 @@
-{"name":"daemon","type":"module","scripts":{"dev":"tsx watch src/server.ts","build":"tsc -p tsconfig.json","build:exe":"bun build src/server.ts --compile --target=bun-windows-x64-baseline --external better-sqlite3 --outfile ../release/local-ai-agent-windows-x64.exe","start":"node dist/server.js"},"dependencies":{"@fastify/cors":"latest","better-sqlite3":"latest","fastify":"latest","zod":"latest"},"devDependencies":{"@types/better-sqlite3":"latest","@types/node":"latest","tsx":"latest","typescript":"latest"}}
+{
+  "name": "daemon",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc -p tsconfig.json",
+    "build:exe": "bun build src/server.ts --compile --target=bun-windows-x64-baseline --external better-sqlite3 --outfile ../release/local-ai-agent-windows-x64.exe",
+    "test:completion": "node tests/completion-bridge.mjs",
+    "start": "node dist/server.js"
+  },
+  "dependencies": {
+    "@fastify/cors": "latest",
+    "better-sqlite3": "latest",
+    "fastify": "latest",
+    "ws": "^8.21.3",
+    "zod": "latest"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "latest",
+    "@types/node": "latest",
+    "@types/ws": "^8.18.1",
+    "tsx": "latest",
+    "typescript": "latest"
+  }
+}

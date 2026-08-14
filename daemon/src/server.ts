@@ -9,6 +9,7 @@ import {git} from './tools/git.js';
 import {log, history} from './db/history.js';
 import {getShellJob, startShellJob} from './jobs.js';
 import {installRequestLogging} from './request-log.js';
+import {installCompletionBridge} from './completion-bridge.js';
 
 const app = Fastify({
   logger: false,
@@ -38,6 +39,7 @@ if (!TOKEN) {
 }
 
 let workspace = path.resolve(process.env.DEEPSEEK_WORKSPACE || process.cwd());
+installCompletionBridge(app, TOKEN);
 
 function auth(req: any, rep: any) {
   if (req.headers.authorization !== `Bearer ${TOKEN}`) {
