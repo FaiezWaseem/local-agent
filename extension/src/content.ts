@@ -44,6 +44,13 @@ type ApprovalSettings = {
   projects?: Record<string, Partial<ApprovalPolicy>>;
 };
 
+type PendingShellJob = {
+  tool_call_id: string;
+  candidate_id: string;
+  tool: 'run_command';
+  started_at: string;
+};
+
 const TOOL_BLOCK_OPEN = '<tool_call>';
 const TOOL_BLOCK_CLOSE = '</tool_call>';
 const LABELED_TOOL_RE = /(?:^|\n)\s*(?:\*\*)?Call Tool:(?:\*\*)?\s*([A-Za-z_][\w-]*)\s*(?:\n|$)\s*(?:\*\*)?Arguments:(?:\*\*)?\s*([\s\S]*?)(?=(?:\n\s*(?:\*\*)?Call Tool:)|$)/gi;
@@ -54,7 +61,9 @@ const CHAT_PROVIDER_NAMES: Record<string, string> = {
 };
 const ZAI_STREAM_EVENT = 'local-ai-agent:zai-answer';
 const TAB_PAUSED_KEY = 'local-ai-agent-paused';
-const PROTOCOL_MARKER = '[LOCAL_AGENT_PROTOCOL_V3]';
+const PENDING_SHELL_JOBS_KEY = 'local-ai-agent-pending-shell-jobs';
+const SHELL_JOB_POLL_MS = 2000;
+const PROTOCOL_MARKER = '[LOCAL_AGENT_PROTOCOL_V4]';
 function localAgentProtocol() {
   const provider = chatProviderName();
   return `${PROTOCOL_MARKER}
@@ -88,6 +97,8 @@ ARGUMENT CONTRACT
 
 RESULT AND COMPLETION CONTRACT
 - A <tool_result> message is authoritative output from the local extension. Read it, continue the original task, and issue the next single local call if needed.
+- The extension assigns every call a unique tool_call_id and returns the same ID in <tool_result>. Use it to associate delayed background shell results with the original call.
+- run_command executes as a background job. Wait for its final <tool_result>; do not repeat the command while it is pending.
 - If a result reports failure, correct the arguments and retry when appropriate. Do not switch to a ${provider}-native tool.
 - Only when the task requires no local tool, or when all required local work is complete, respond normally with a concise answer.`;
 }
@@ -144,6 +155,7 @@ function statusLabel(state: string) {
     detected: 'Tool detected',
     approval: 'Needs approval',
     executing: 'Working',
+    background: 'Background job',
     cooldown: 'Cooling down',
     sending: 'Sending result',
     waiting: 'Waiting',
@@ -429,6 +441,7 @@ async function ensureIndicator() {
       }
       #count { color: #b5c2bc; font-weight: 700; }
       #card[data-state="executing"] .header-dot,
+      #card[data-state="background"] .header-dot,
       #card[data-state="detected"] .header-dot,
       #card[data-state="approval"] .header-dot,
       #card[data-state="cooldown"] .header-dot,
@@ -438,6 +451,7 @@ async function ensureIndicator() {
         animation: pulse 1s ease-in-out infinite;
       }
       #card[data-state="executing"] #state,
+      #card[data-state="background"] #state,
       #card[data-state="detected"] #state,
       #card[data-state="approval"] #state,
       #card[data-state="cooldown"] #state,
