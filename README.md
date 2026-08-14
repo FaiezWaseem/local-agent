@@ -8,6 +8,7 @@ Experimental Chrome extension + localhost Node daemon that gives DeepSeek, Qwen,
 - Direct Connect and Stop controls in the floating monitor, scoped to the current tab
 - Automatic failure results so the model can correct malformed or failed tool calls
 - Strict tool-protocol reinforcement on every outgoing DeepSeek, Qwen, and Z.ai message, including a ban on provider-native tools
+- Provider-wide recovery for wrapped, fenced, and renderer-stripped JSON tool calls
 - GLM/Z.ai streamed and rendered fenced-JSON tool-call detection when the model omits `<tool_call>` markup
 - Project/workspace boundary
 - Pairing token stored at `~/.deepseek-local/token`

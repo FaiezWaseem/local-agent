@@ -118,6 +118,7 @@ let protocolReinforcementPending = false;
 let agentRunning = false;
 let agentRunGeneration = 0;
 let indicatorControlsBusy = false;
+let protocolReinforcementEnabled = true;
 
 function chatProviderName() {
   return CHAT_PROVIDER_NAMES[location.hostname] || 'AI chat';
@@ -128,7 +129,7 @@ function shouldReinforceProtocol() {
 }
 
 function withReinforcedProtocol(text: string) {
-  if (!agentRunning || !shouldReinforceProtocol() || text.includes(PROTOCOL_MARKER)) return text;
+  if (!protocolReinforcementEnabled || !shouldReinforceProtocol() || text.includes(PROTOCOL_MARKER)) return text;
   return `${text.trimEnd()}\n\n${localAgentProtocol()}`;
 }
 
@@ -255,7 +256,7 @@ function syncIndicatorControls() {
   if (!indicatorRefs) return;
   indicatorRefs.card.dataset.running = String(agentRunning);
   indicatorRefs.connect.disabled = agentRunning || indicatorControlsBusy;
-  indicatorRefs.stop.disabled = !agentRunning || indicatorControlsBusy;
+  indicatorRefs.stop.disabled = (!agentRunning && !protocolReinforcementEnabled) || indicatorControlsBusy;
 }
 
 function setAgentRunning(running: boolean) {
@@ -600,8 +601,8 @@ function parseToolBlock(payload: string) {
   } satisfies ToolCall;
 }
 
-function parseZaiCodeToolCall(payload: string) {
-  if (location.hostname !== 'chat.z.ai') return null;
+function parseProviderJsonToolCall(payload: string) {
+  if (!shouldReinforceProtocol()) return null;
 
   try {
     const parsed = JSON.parse(stripCodeFence(payload)) as Record<string, unknown>;
@@ -626,7 +627,7 @@ function installZaiStreamBridge() {
     const answer = (event as CustomEvent<unknown>).detail;
     if (typeof answer !== 'string') return;
 
-    const call = parseZaiCodeToolCall(answer);
+    const call = parseProviderJsonToolCall(answer);
     if (!call) return;
 
     const id = toolCallIdentity(call);
@@ -795,6 +796,7 @@ async function connectAgent() {
 
     const connectedWorkspace = String(workspaceResult.workspace || workspace);
     setTabPaused(false);
+    protocolReinforcementEnabled = true;
     setAgentRunning(true);
     nextAllowedSubmissionAt = 0;
     await chrome.storage.local.set({workspace: connectedWorkspace, connectedWorkspace});
@@ -813,9 +815,10 @@ async function connectAgent() {
 }
 
 async function stopAgent() {
-  if (!agentRunning || indicatorControlsBusy) return;
+  if ((!agentRunning && !protocolReinforcementEnabled) || indicatorControlsBusy) return;
 
   setTabPaused(true);
+  protocolReinforcementEnabled = false;
   setAgentRunning(false);
   streamedZaiCalls.clear();
   protocolReinforcementPending = false;
@@ -1000,7 +1003,7 @@ function pressEnter(composer: HTMLElement) {
 }
 
 async function reinforceComposerAndReplay(composer: HTMLElement, replay: () => void) {
-  if (!agentRunning || protocolSendReplay || protocolReinforcementPending) return;
+  if (!protocolReinforcementEnabled || protocolSendReplay || protocolReinforcementPending) return;
   const generation = agentRunGeneration;
 
   const currentText = composerText(composer);
@@ -1014,7 +1017,7 @@ async function reinforceComposerAndReplay(composer: HTMLElement, replay: () => v
     setComposer(composer, withReinforcedProtocol(currentText));
     await updateStatus('waiting', `${chatProviderName()} tool instructions reinforced for this message.`).catch(() => undefined);
     await new Promise(resolve => setTimeout(resolve, 150));
-    if (!agentRunning || generation !== agentRunGeneration) return;
+    if (!protocolReinforcementEnabled || generation !== agentRunGeneration) return;
     protocolReinforcementPending = false;
     protocolSendReplay = true;
     replay();
@@ -1033,7 +1036,7 @@ function installProtocolReinforcement() {
     if (event.key !== 'Enter' || event.shiftKey || event.ctrlKey || event.altKey || event.metaKey || event.isComposing) {
       return;
     }
-    if (!agentRunning) return;
+    if (!protocolReinforcementEnabled) return;
 
     const composer = findComposer();
     const target = event.target as Node | null;
@@ -1052,7 +1055,7 @@ function installProtocolReinforcement() {
   }, true);
 
   document.addEventListener('click', event => {
-    if (!agentRunning) return;
+    if (!protocolReinforcementEnabled) return;
     const composer = findComposer();
     const target = event.target as Node | null;
     if (!composer || !target) return;
@@ -1073,7 +1076,7 @@ function installProtocolReinforcement() {
   }, true);
 
   document.addEventListener('submit', event => {
-    if (!agentRunning) return;
+    if (!protocolReinforcementEnabled) return;
     const composer = findComposer();
     const form = event.target as HTMLFormElement;
     if (!composer || composer.closest('form') !== form) return;
@@ -1177,7 +1180,7 @@ function inferToolName(payload: string) {
 
 function findToolCandidates() {
   const candidates = new Map<string, ToolCandidate>();
-  const nodes = document.querySelectorAll('pre,code,article,div,p,span');
+  const nodes = document.querySelectorAll('pre,code,article,div,p,span,tool_call,tool-call');
 
   for (const node of nodes) {
     const element = node as HTMLElement;
@@ -1186,23 +1189,21 @@ function findToolCandidates() {
     const text = (element.innerText || element.textContent || '').trim();
     if (!text) continue;
 
-    const isCodeBlock = (element.tagName === 'CODE' && Boolean(element.closest('pre')))
-      || (element.tagName === 'PRE' && !element.querySelector('code'));
-    if (isCodeBlock) {
-      const call = parseZaiCodeToolCall(text);
-      if (call) {
-        const id = toolCallIdentity(call);
-        candidates.set(id, {id, call});
-      }
+    const renderedJsonCall = parseProviderJsonToolCall(text);
+    if (renderedJsonCall) {
+      const id = toolCallIdentity(renderedJsonCall);
+      candidates.set(id, {id, call: renderedJsonCall});
     }
 
     for (const block of extractToolBlocks(text)) {
       const {payload} = block;
-      const id = hash(`tool_block:${payload}`);
-      if (candidates.has(id)) continue;
       try {
-        candidates.set(id, {id, call: parseToolBlock(payload), repaired: block.repaired});
+        const call = parseToolBlock(payload);
+        const id = toolCallIdentity(call);
+        if (!candidates.has(id)) candidates.set(id, {id, call, repaired: block.repaired});
       } catch (error) {
+        const id = hash(`tool_block_error:${payload}`);
+        if (candidates.has(id)) continue;
         candidates.set(id, {
           id,
           toolName: inferToolName(payload),
@@ -1340,9 +1341,10 @@ function installConnectionStorageSync() {
       indicatorRefs.project.textContent = `${chatProviderName()} - ${projectName(String(workspace))}`;
     }
 
-    if (!changes.token && !changes.connectedWorkspace) return;
-    void chrome.storage.local.get(['token', 'connectedWorkspace']).then(async values => {
-      const hasConnection = Boolean(values.token && values.connectedWorkspace);
+    if (!changes.token && !changes.workspace && !changes.connectedWorkspace) return;
+    void chrome.storage.local.get(['token', 'workspace', 'connectedWorkspace']).then(async values => {
+      const activeWorkspace = values.connectedWorkspace || values.workspace;
+      const hasConnection = Boolean(values.token && activeWorkspace);
       if (!hasConnection) {
         if (agentRunning) {
           setAgentRunning(false);
@@ -1353,7 +1355,7 @@ function installConnectionStorageSync() {
 
       if (!tabIsPaused() && !agentRunning) {
         setAgentRunning(true);
-        await updateStatus('waiting', `Connected to ${projectName(String(values.connectedWorkspace))}. Waiting for a local tool call.`);
+        await updateStatus('waiting', `Connected to ${projectName(String(activeWorkspace))}. Waiting for a local tool call.`);
         queueScan();
       }
     }).catch(() => undefined);
@@ -1369,8 +1371,10 @@ async function init() {
   }
 
   agentWindow.__deepseekLocalAgentLoaded = true;
-  const connection = await chrome.storage.local.get(['token', 'connectedWorkspace']);
-  setAgentRunning(Boolean(connection.token && connection.connectedWorkspace) && !tabIsPaused());
+  const connection = await chrome.storage.local.get(['token', 'workspace', 'connectedWorkspace']);
+  const activeWorkspace = connection.connectedWorkspace || connection.workspace;
+  protocolReinforcementEnabled = !tabIsPaused();
+  setAgentRunning(Boolean(connection.token && activeWorkspace) && protocolReinforcementEnabled);
   installProtocolReinforcement();
   installZaiStreamBridge();
   installConnectionStorageSync();
@@ -1382,10 +1386,10 @@ async function init() {
   });
 
   if (agentRunning) {
-    await updateStatus('waiting', `Connected to ${projectName(String(connection.connectedWorkspace))}. Waiting for a local tool call.`);
+    await updateStatus('waiting', `Connected to ${projectName(String(activeWorkspace))}. Waiting for a local tool call.`);
     queueScan();
   } else {
-    const message = connection.token && connection.connectedWorkspace
+    const message = connection.token && activeWorkspace
       ? 'Stopped on this tab. Connect to resume local tools.'
       : 'Not connected. Save a token and project in the popup, then connect here.';
     await updateStatus('stopped', message);
