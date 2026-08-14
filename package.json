@@ -7,6 +7,7 @@
     ],
     "scripts": {
         "build": "npm -w daemon run build && npm -w extension run build",
+        "build:exe": "npm -w daemon run build:exe",
         "dev:daemon": "npm -w daemon run dev",
         "start": "npm -w daemon start"
     }

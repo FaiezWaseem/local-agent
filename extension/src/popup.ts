@@ -26,6 +26,11 @@ const CHAT_PROVIDERS: Record<string, string> = {
 };
 const DEFAULT_RESULT_DELAY_MS = 5000;
 const EMPTY_POLICY: ApprovalPolicy = {edits: false, deletes: false, shell: false};
+const INITIAL_PROMPT = [
+  'Never invoke native or built-in provider tools. The only permitted tools are read_file, write_file, edit_file, delete_file, list_directory, run_command, git_status, git_diff, and git_log.',
+  'When local work is required, emit exactly one plain-text `<tool_call>` envelope containing strict JSON shaped as `{"name":"TOOL_NAME","arguments":{}}`, then stop and wait for `<tool_result>`.',
+  'Do not add prose or Markdown fences around a tool call, simulate a result, or merely describe file and shell actions. Paths are relative to the active project. For edit_file use path, old_text, and new_text.'
+].join('\n');
 const $ = <T extends HTMLElement>(selector: string) => document.querySelector(selector) as T;
 
 const statusEl = $('#s');
@@ -42,6 +47,10 @@ const approveEditsEl = $('#approveEdits') as HTMLInputElement;
 const approveDeletesEl = $('#approveDeletes') as HTMLInputElement;
 const approveShellEl = $('#approveShell') as HTMLInputElement;
 const resultDelayEl = $('#resultDelay') as HTMLSelectElement;
+const initialPromptEl = $('#initialPrompt') as HTMLTextAreaElement;
+const copyPromptEl = $('#copyPrompt') as HTMLButtonElement;
+
+initialPromptEl.value = INITIAL_PROMPT;
 
 let connectedWorkspace = '';
 let approvalSettings: ApprovalSettings = {
@@ -357,6 +366,28 @@ resultDelayEl.addEventListener('change', async () => {
   const resultDelayMs = Number(resultDelayEl.value) || DEFAULT_RESULT_DELAY_MS;
   await chrome.storage.local.set({resultDelayMs});
   setStatus(`Automatic tool results will wait ${resultDelayMs / 1000} seconds.`, 'success');
+});
+
+copyPromptEl.addEventListener('click', async () => {
+  const idleLabel = copyPromptEl.textContent || 'Copy prompt';
+  try {
+    await navigator.clipboard.writeText(INITIAL_PROMPT);
+    copyPromptEl.textContent = 'Copied';
+    setStatus('Initial prompt copied to the clipboard.', 'success');
+  } catch {
+    initialPromptEl.focus();
+    initialPromptEl.select();
+    if (!document.execCommand('copy')) {
+      setStatus('Could not copy automatically. Select the prompt and copy it manually.', 'error');
+      return;
+    }
+    copyPromptEl.textContent = 'Copied';
+    setStatus('Initial prompt copied to the clipboard.', 'success');
+  } finally {
+    window.setTimeout(() => {
+      copyPromptEl.textContent = idleLabel;
+    }, 1400);
+  }
 });
 
 chrome.storage.onChanged.addListener(changes => {

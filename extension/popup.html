@@ -43,14 +43,14 @@
       background-image: repeating-linear-gradient(0deg, transparent 0 21px, rgba(24, 35, 31, 0.035) 22px);
     }
 
-    button, input { font: inherit; }
+    button, input, textarea { font: inherit; }
 
     button {
       cursor: pointer;
       border: 0;
     }
 
-    button:focus-visible, input:focus-visible, label:has(input:focus-visible) {
+    button:focus-visible, input:focus-visible, textarea:focus-visible, label:has(input:focus-visible) {
       outline: 3px solid rgba(233, 95, 55, 0.25);
       outline-offset: 2px;
     }
@@ -221,6 +221,45 @@
 
     .button.primary:hover { background: var(--accent-dark); }
     .button:disabled { cursor: wait; opacity: 0.65; transform: none; }
+
+    .prompt-card {
+      border-color: rgba(24, 35, 31, 0.82);
+      color: #f8f3e9;
+      background:
+        radial-gradient(circle at 100% 0, rgba(233, 95, 55, 0.27), transparent 42%),
+        #1c2924;
+    }
+
+    .prompt-card .card-copy { color: #abbab2; }
+
+    .prompt-copy {
+      min-height: 31px;
+      flex: 0 0 auto;
+      color: #18231f;
+      border-color: #ef7a58;
+      background: #f28a68;
+    }
+
+    .prompt-copy:hover { background: #f5a087; }
+
+    #initialPrompt {
+      display: block;
+      width: 100%;
+      min-height: 148px;
+      padding: 11px 12px;
+      resize: vertical;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      border-radius: 11px;
+      color: #eaf2ed;
+      background: rgba(5, 12, 9, 0.42);
+      font: 10px/1.5 Consolas, "Courier New", monospace;
+      scrollbar-color: #64766d transparent;
+    }
+
+    #initialPrompt:focus {
+      border-color: #f28a68;
+      outline: 0;
+    }
 
     .settings-card[data-locked="true"] .settings-body {
       pointer-events: none;
@@ -465,6 +504,17 @@
         <button id="attach" class="button" type="button">Attach tab</button>
         <button id="health" class="button" type="button">Check</button>
       </div>
+    </section>
+
+    <section class="card prompt-card" aria-labelledby="promptTitle">
+      <div class="card-heading">
+        <div>
+          <h2 id="promptTitle">Initial prompt</h2>
+          <p class="card-copy">Optional starter for a new AI chat.</p>
+        </div>
+        <button id="copyPrompt" class="button prompt-copy" type="button">Copy prompt</button>
+      </div>
+      <textarea id="initialPrompt" readonly spellcheck="false" aria-label="Initial local agent prompt"></textarea>
     </section>
 
     <section id="settingsCard" class="card settings-card" data-locked="true" aria-labelledby="settingsTitle">

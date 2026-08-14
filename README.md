@@ -9,6 +9,7 @@ Experimental Chrome extension + localhost Node daemon that gives DeepSeek, Qwen,
 - Automatic failure results so the model can correct malformed or failed tool calls
 - Strict tool-protocol reinforcement on every outgoing DeepSeek, Qwen, and Z.ai message, including a ban on provider-native tools
 - Provider-wide recovery for wrapped, fenced, and renderer-stripped JSON tool calls
+- Copy-ready initial prompt in the extension popup
 - GLM/Z.ai streamed and rendered fenced-JSON tool-call detection when the model omits `<tool_call>` markup
 - Project/workspace boundary
 - Pairing token stored at `~/.deepseek-local/token`
@@ -28,6 +29,16 @@ DEEPSEEK_WORKSPACE=/absolute/path/to/project npm start
 ```
 
 The daemon prints a pairing token. In Chrome open `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and select `extension/dist`. Open `https://chat.deepseek.com/`, `https://chat.qwen.ai/`, or `https://chat.z.ai/`, then open the extension popup, paste the token and absolute project path, and click **Connect**. If the chat tab was already open before the extension loaded, click **Attach Tab** once. After connecting, approval switches can be applied to the current project or to every project used by this browser profile.
+
+### Standalone Windows daemon
+
+With Bun installed on the build machine, create a portable Windows x64 executable:
+
+```bash
+npm run build:exe
+```
+
+Share `release/local-ai-agent-windows-x64.exe`. The recipient does not need Node.js, npm, or Bun. Run the executable, keep its console window open, and use the printed pairing token in the extension popup. The popup sets the active project path after connecting.
 
 ## Chat instruction
 DeepSeek, Qwen, and Z.ai receive the strict V3 protocol automatically with every outgoing message. It explicitly disables provider-native tools and requires local calls to be emitted as literal assistant text. The equivalent protocol is:
