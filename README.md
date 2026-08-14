@@ -4,6 +4,7 @@ Experimental Chrome extension + localhost Node daemon that gives DeepSeek, Qwen,
 
 ## Features
 - Automatic `<tool_call>` detection with a configurable 3-12 second result cooldown
+- Message-occurrence-aware detection so identical tool calls can run again without replaying historical DOM copies
 - Background `run_command` execution with live elapsed-time polling and resume after tab refresh
 - Unique `tool_call_id` correlation across requests, delayed results, failures, and SQLite history
 - Draggable in-page activity monitor with an active-tool command line, live send-countdown states, and expandable input/output history
