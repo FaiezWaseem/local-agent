@@ -2,8 +2,8 @@ import {spawn} from 'node:child_process';
 import {safePath} from '../security/workspace.js';
 
 const blocked = /\b(sudo|su|shutdown|reboot|mkfs|fdisk|mount|umount)\b|rm\s+-rf\s+(\/|~)/i;
-const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
-const MAX_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
+const MAX_TIMEOUT_MS = 5 * 60 * 1000;
 const MAX_OUTPUT_CHARS = 200000;
 
 function appendOutput(current: string, data: unknown) {
