@@ -2271,6 +2271,7 @@ async function reinforceComposerAndReplay(composer: HTMLElement, replay: () => v
   protocolReinforcementPending = true;
   try {
     setComposer(composer, withReinforcedProtocol(currentText));
+    window.setTimeout(() => hideVisibleProtocolText(), 150);
     await updateStatus('waiting', `${chatProviderName()} tool instructions reinforced for this message.`).catch(() => undefined);
     await new Promise(resolve => setTimeout(resolve, 150));
     if (!protocolReinforcementEnabled || generation !== agentRunGeneration) return;
@@ -2453,6 +2454,7 @@ async function feed(result: unknown) {
   }
 
   setComposer(composer, text);
+  window.setTimeout(() => hideVisibleProtocolText(), 150);
   const delayMs = await configuredSubmissionDelayMs();
   if (!await submitResult(delayMs)) {
     throw new Error(`Could not auto-submit the tool result. ${chatProviderName()} UI selectors may need updating.`);
@@ -2463,6 +2465,7 @@ type ToolCandidate = {
   id: string;
   baseId: string;
   source: 'dom' | 'stream';
+  element?: HTMLElement;
   call?: ToolCall;
   error?: string;
   repaired?: boolean;
@@ -2518,6 +2521,100 @@ function candidateSourceKey(element: HTMLElement) {
   return `path:${elementPath(source)}`;
 }
 
+function protocolVisibleReplacement(text: string) {
+  const trimmed = text.trim();
+  if (!trimmed.includes(PROTOCOL_MARKER)) return null;
+
+  const markerIndex = trimmed.indexOf(PROTOCOL_MARKER);
+  const visiblePrefix = trimmed.slice(0, markerIndex).trim();
+  const toolResultPrefix = trimmed.match(/^<tool_result>[\s\S]*?<\/tool_result>/)?.[0];
+  const prefix = visiblePrefix || toolResultPrefix || '';
+  return prefix
+    ? `${prefix}\n[local-agent instructions hidden]`
+    : '[local-agent instructions hidden]';
+}
+
+function toolResultPlaceholder(text: string) {
+  const match = text.match(/<tool_result>\s*([\s\S]*?)\s*<\/tool_result>/i);
+  if (!match) return null;
+
+  const payload = match[1]?.trim() || '';
+  let toolName = 'unknown';
+  let status = 'done';
+  try {
+    const parsed = JSON.parse(payload) as {
+      tool?: unknown;
+      success?: unknown;
+      pending?: unknown;
+      error?: unknown;
+    };
+    if (typeof parsed.tool === 'string' && parsed.tool.trim()) {
+      toolName = parsed.tool.trim();
+    }
+    if (parsed.pending === true) {
+      status = 'pending';
+    } else if (parsed.success === false || parsed.error) {
+      status = 'failed';
+    } else {
+      status = 'done';
+    }
+  } catch {
+    status = 'done';
+  }
+
+  return `[tool_result][${toolName}][${status}][char-${payload.length}]`;
+}
+
+function hideVisibleProtocolText() {
+  const nodes = document.querySelectorAll<HTMLElement>('article,div,p,span,pre,code');
+  for (const element of nodes) {
+    if (element.closest('form,textarea,[role="textbox"],[contenteditable]:not([contenteditable="false"])')) continue;
+    const source = candidateMessageSource(element);
+    if (source.dataset.localAgentProtocolHidden === 'true') continue;
+
+    const text = (source.innerText || source.textContent || '').trim();
+    const replacement = protocolVisibleReplacement(text);
+    const toolResultReplacement = toolResultPlaceholder(text);
+    if (!replacement && !toolResultReplacement) continue;
+
+    const walker = document.createTreeWalker(source, NodeFilter.SHOW_TEXT);
+    let replaced = false;
+    let node = walker.nextNode();
+    while (node) {
+      const textNode = node as Text;
+      const value = textNode.nodeValue || '';
+      let nextValue = value;
+      let changed = false;
+
+      if (toolResultReplacement && nextValue.includes('<tool_result>')) {
+        nextValue = nextValue.replace(/<tool_result>[\s\S]*?<\/tool_result>/i, toolResultReplacement);
+        changed = true;
+      }
+
+      if (replacement && nextValue.includes(PROTOCOL_MARKER)) {
+        const markerIndex = nextValue.indexOf(PROTOCOL_MARKER);
+        const prefix = nextValue.slice(0, markerIndex).trimEnd();
+        nextValue = prefix
+          ? `${prefix}\n[local-agent instructions hidden]`
+          : '[local-agent instructions hidden]';
+        changed = true;
+      }
+
+      if (!changed) {
+        node = walker.nextNode();
+        continue;
+      }
+      textNode.nodeValue = nextValue;
+      replaced = true;
+      node = walker.nextNode();
+    }
+
+    if (replaced) {
+      source.dataset.localAgentProtocolHidden = 'true';
+    }
+  }
+}
+
 function latestSourcedCandidate(records: SourcedCandidate[]) {
   const groups = new Map<string, SourcedCandidate[]>();
   for (const record of records) {
@@ -2546,7 +2643,34 @@ function latestSourcedCandidate(records: SourcedCandidate[]) {
     return undefined;
   }
   if (handled.has(id)) return undefined;
-  return {id, baseId: latest.baseId, source: 'dom', ...latest.value} satisfies ToolCandidate;
+  return {id, baseId: latest.baseId, source: 'dom', element: latest.element, ...latest.value} satisfies ToolCandidate;
+}
+
+function toolCallPlaceholder(call: ToolCall) {
+  return `[toolcall][${call.name}] working...`;
+}
+
+function renderToolCallPlaceholder(element: HTMLElement, call: ToolCall) {
+  const source = candidateMessageSource(element);
+  if (source.dataset.localAgentToolcallHidden === 'true') return;
+  source.dataset.localAgentToolcallHidden = 'true';
+  source.setAttribute('data-local-agent-toolcall', call.name);
+
+  const textNodes = source.querySelectorAll('pre,code,p,span,div');
+  let replaced = false;
+  for (const node of textNodes) {
+    const target = node as HTMLElement;
+    const text = (target.innerText || target.textContent || '').trim();
+    if (!text || (!text.includes(TOOL_BLOCK_OPEN) && !text.includes(`"name":"${call.name}"`) && !text.includes(`"name": "${call.name}"`))) {
+      continue;
+    }
+    target.textContent = toolCallPlaceholder(call);
+    replaced = true;
+  }
+
+  if (!replaced) {
+    source.textContent = toolCallPlaceholder(call);
+  }
 }
 
 function latestRenderedJsonCandidate() {
@@ -2798,6 +2922,9 @@ async function scan() {
 
     const call = candidate.call;
     if (!call) continue;
+    if (candidate.source === 'dom' && candidate.element) {
+      renderToolCallPlaceholder(candidate.element, call);
+    }
 
     toolCallCount += 1;
     setActiveTool(call, callId);
@@ -2906,12 +3033,18 @@ async function init() {
     childList: true,
     characterData: true
   });
+  new MutationObserver(() => hideVisibleProtocolText()).observe(document.documentElement, {
+    subtree: true,
+    childList: true,
+    characterData: true
+  });
 
   if (agentRunning) {
     await updateStatus('waiting', `Connected to ${projectName(String(activeWorkspace))}. Waiting for a local tool call.`);
     void resumePendingShellJobs();
     void openCompletionBridge();
     queueScan();
+    hideVisibleProtocolText();
   } else {
     const message = connection.token && activeWorkspace
       ? 'Stopped on this tab. Connect to resume local tools.'
