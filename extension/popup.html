@@ -454,6 +454,66 @@
     .status-card[data-state="error"] { background: var(--red-soft); }
     .status-card[data-state="error"] .status-dot { background: #b83d2d; }
 
+    .toast {
+      position: fixed;
+      right: 16px;
+      bottom: 16px;
+      left: 16px;
+      z-index: 20;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 11px 13px;
+      border: 1px solid rgba(192, 183, 166, 0.75);
+      border-radius: 12px;
+      color: var(--ink);
+      background: rgba(255, 253, 247, 0.97);
+      box-shadow: 0 10px 24px rgba(40, 47, 41, 0.18);
+      opacity: 0;
+      transform: translateY(12px);
+      pointer-events: none;
+      transition: opacity 180ms ease, transform 180ms ease;
+    }
+
+    .toast[data-open="true"] {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    .toast::before {
+      width: 10px;
+      height: 10px;
+      content: "";
+      flex: 0 0 auto;
+      border-radius: 50%;
+      background: #9f9b91;
+      box-shadow: 0 0 0 4px rgba(159, 155, 145, 0.14);
+    }
+
+    .toast[data-tone="success"]::before {
+      background: var(--green);
+      box-shadow: 0 0 0 4px rgba(30, 114, 83, 0.14);
+    }
+
+    .toast[data-tone="error"]::before {
+      background: #b83d2d;
+      box-shadow: 0 0 0 4px rgba(184, 61, 45, 0.14);
+    }
+
+    .toast[data-tone="busy"]::before {
+      background: #cc8916;
+      box-shadow: 0 0 0 4px rgba(204, 137, 22, 0.14);
+      animation: pulse 1s infinite;
+    }
+
+    .toast-text {
+      min-width: 0;
+      overflow-wrap: anywhere;
+      font-size: 11px;
+      font-weight: 800;
+      line-height: 1.35;
+    }
+
     #s {
       min-width: 0;
       overflow-wrap: anywhere;
@@ -596,6 +656,10 @@
       <div id="s">Waiting for connection.</div>
     </div>
   </main>
+
+  <div id="toast" class="toast" data-open="false" data-tone="neutral" role="status" aria-live="polite" aria-atomic="true">
+    <div id="toastText" class="toast-text"></div>
+  </div>
 
   <script type="module" src="/src/popup.ts"></script>
 </body>

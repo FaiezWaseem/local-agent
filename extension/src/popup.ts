@@ -51,10 +51,14 @@ const approveShellEl = $('#approveShell') as HTMLInputElement;
 const resultDelayEl = $('#resultDelay') as HTMLSelectElement;
 const initialPromptEl = $('#initialPrompt') as HTMLTextAreaElement;
 const copyPromptEl = $('#copyPrompt') as HTMLButtonElement;
+const attachEl = $('#attach') as HTMLButtonElement;
+const toastEl = $('#toast');
+const toastTextEl = $('#toastText');
 
 initialPromptEl.value = INITIAL_PROMPT;
 
 let connectedWorkspace = '';
+let toastTimer = 0;
 let approvalSettings: ApprovalSettings = {
   scope: 'project',
   global: {...EMPTY_POLICY},
@@ -99,6 +103,18 @@ function settingsFrom(value: unknown): ApprovalSettings {
 function setStatus(text: string, tone: StatusTone = 'neutral') {
   statusEl.textContent = text;
   statusCardEl.dataset.state = tone;
+}
+
+function showToast(text: string, tone: StatusTone = 'neutral', durationMs = 2200) {
+  if (!toastEl || !toastTextEl) return;
+  if (toastTimer) window.clearTimeout(toastTimer);
+  toastTextEl.textContent = text;
+  toastEl.dataset.tone = tone;
+  toastEl.dataset.open = 'true';
+  toastTimer = window.setTimeout(() => {
+    toastEl.dataset.open = 'false';
+    toastTimer = 0;
+  }, durationMs);
 }
 
 function setConnected(connected: boolean) {
@@ -323,13 +339,22 @@ saveEl.addEventListener('click', async () => {
   }
 });
 
-$('#attach').addEventListener('click', async () => {
+attachEl.addEventListener('click', async () => {
+  const idleLabel = attachEl.textContent || 'Attach tab';
   try {
+    attachEl.disabled = true;
+    attachEl.textContent = 'Attaching...';
     setStatus('Attaching to the active AI chat tab...', 'busy');
     const agentStatus = await attachToActiveTab();
     setStatus(formatAgentStatus(agentStatus), statusTone(agentStatus));
+    showToast('Attached to the active AI chat tab.', 'success');
   } catch (error) {
-    setStatus((error as Error).message, 'error');
+    const message = (error as Error).message;
+    setStatus(message, 'error');
+    showToast(message, 'error', 3000);
+  } finally {
+    attachEl.disabled = false;
+    attachEl.textContent = idleLabel;
   }
 });
 

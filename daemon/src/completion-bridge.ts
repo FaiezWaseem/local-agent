@@ -187,6 +187,22 @@ export function installCompletionBridge(app: FastifyInstance, token: string) {
   const pending = new Map<string, PendingCompletion>();
   const subscribers = new Set<EventSubscriber>();
 
+  const clientSnapshot = (client: BridgeClient) => ({
+    client_id: client.id,
+    provider: client.provider || null,
+    busy: client.busy,
+    ready_state: client.socket.readyState,
+    url: client.url || null
+  });
+
+  const matchingClients = (model: string) => {
+    const requestedProvider = providerForModel(model);
+    return [...clients].filter(client => (
+      client.provider
+      && (!requestedProvider || client.provider === requestedProvider)
+    ));
+  };
+
   const publish = (type: string, details: Record<string, unknown> = {}) => {
     const event: Record<string, unknown> = {type, ts: new Date().toISOString(), ...details};
     const {delta, content, ...safeEvent} = event;
@@ -209,6 +225,10 @@ export function installCompletionBridge(app: FastifyInstance, token: string) {
     if (item.heartbeat) clearInterval(item.heartbeat);
     pending.delete(item.id);
     item.client.busy = false;
+    publish('bridge.client.released', {
+      request_id: item.id,
+      ...clientSnapshot(item.client)
+    });
     return true;
   };
 
@@ -303,6 +323,7 @@ export function installCompletionBridge(app: FastifyInstance, token: string) {
       client.url = String(message.url || '').slice(0, 1000);
       socketSend(client.socket, {type: 'bridge.ready', client_id: client.id, provider});
       publish('bridge.connected', {client_id: client.id, provider, url: client.url});
+      publish('bridge.client.state', clientSnapshot(client));
       return;
     }
 
@@ -392,6 +413,7 @@ export function installCompletionBridge(app: FastifyInstance, token: string) {
   wss.on('connection', socket => {
     const client: BridgeClient = {id: crypto.randomUUID(), busy: false, socket};
     clients.add(client);
+    publish('bridge.socket.open', clientSnapshot(client));
 
     socket.on('message', raw => handleBridgeMessage(client, raw));
     socket.on('close', () => {
@@ -399,18 +421,42 @@ export function installCompletionBridge(app: FastifyInstance, token: string) {
       for (const item of [...pending.values()]) {
         if (item.client === client) fail(item, new BridgeError('Extension tab disconnected.', 503, 'bridge_disconnected'));
       }
+      publish('bridge.socket.closed', clientSnapshot(client));
       if (client.provider) publish('bridge.disconnected', {client_id: client.id, provider: client.provider});
     });
   });
 
   const selectClient = (model: string) => {
-    const requestedProvider = providerForModel(model);
-    return [...clients].find(client => (
-      client.provider
-      && (!requestedProvider || client.provider === requestedProvider)
-      && !client.busy
+    const matches = matchingClients(model);
+    publish('bridge.select.inspect', {
+      model,
+      requested_provider: providerForModel(model) || 'auto',
+      matching_clients: matches.map(clientSnapshot)
+    });
+    return matches.find(client => (
+      !client.busy
       && client.socket.readyState === WebSocket.OPEN
     ));
+  };
+
+  const bridgeUnavailableReason = (model: string) => {
+    const matches = matchingClients(model);
+    if (!matches.length) {
+      return {
+        message: `No extension tab is connected for model ${model}.`,
+        code: 'bridge_unavailable'
+      };
+    }
+    if (matches.some(client => client.busy)) {
+      return {
+        message: `An extension tab is connected for model ${model}, but it is busy.`,
+        code: 'bridge_busy'
+      };
+    }
+    return {
+      message: `An extension tab is connected for model ${model}, but its bridge is not open.`,
+      code: 'bridge_disconnected'
+    };
   };
 
   const startCompletion = (body: CompletionBody, client: BridgeClient, response?: ServerResponse) => {
@@ -448,6 +494,10 @@ export function installCompletionBridge(app: FastifyInstance, token: string) {
     };
 
     client.busy = true;
+    publish('bridge.client.busy', {
+      request_id: id,
+      ...clientSnapshot(client)
+    });
     pending.set(id, item);
     publish('completion.queued', {request_id: id, provider, model: body.model, stream: body.stream});
     try {
@@ -534,12 +584,23 @@ export function installCompletionBridge(app: FastifyInstance, token: string) {
 
     const client = selectClient(parsed.data.model);
     if (!client) {
+      const unavailable = bridgeUnavailableReason(parsed.data.model);
+      publish('bridge.select.rejected', {
+        model: parsed.data.model,
+        reason: unavailable.code,
+        message: unavailable.message,
+        matching_clients: matchingClients(parsed.data.model).map(clientSnapshot)
+      });
       return reply.code(503).send(openAiError(
-        `No idle extension tab is connected for model ${parsed.data.model}.`,
-        'bridge_unavailable',
+        unavailable.message,
+        unavailable.code,
         'service_unavailable_error'
       ));
     }
+    publish('bridge.select.accepted', {
+      model: parsed.data.model,
+      ...clientSnapshot(client)
+    });
 
     if (parsed.data.stream) {
       reply.hijack();

@@ -22,7 +22,20 @@ await app.register(cors, {
     'https://chat.deepseek.com',
     'https://chat.qwen.ai',
     'https://chat.z.ai'
-  ]
+  ],
+  hook: 'onRequest'
+});
+
+app.addHook('onSend', async (req, rep, payload) => {
+  const origin = String(req.headers.origin || '');
+  if (
+    origin
+    && ['https://chat.deepseek.com', 'https://chat.qwen.ai', 'https://chat.z.ai'].includes(origin)
+    && req.headers['access-control-request-private-network'] === 'true'
+  ) {
+    rep.header('Access-Control-Allow-Private-Network', 'true');
+  }
+  return payload;
 });
 
 const cfgDir = path.join(os.homedir(), '.deepseek-local');

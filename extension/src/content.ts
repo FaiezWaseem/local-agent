@@ -234,6 +234,18 @@ let completionBridgeReconnectAttempt = 0;
 let activeBridgeCompletion: ActiveBridgeCompletion | null = null;
 let bridgeResponseSuppressionActive = false;
 
+function bridgeLog(event: string, details: Record<string, unknown> = {}) {
+  console.info('[LocalAgentBridge]', {
+    event,
+    provider: completionBridgeProvider() || null,
+    agentRunning,
+    socketState: completionBridgeSocket?.readyState ?? null,
+    activeRequestId: activeBridgeCompletion?.id || null,
+    url: location.href,
+    ...details
+  });
+}
+
 function chatProviderName() {
   return CHAT_PROVIDER_NAMES[location.hostname] || 'AI chat';
 }
@@ -512,9 +524,9 @@ async function loadToolHistory() {
   try {
     const {token} = await chrome.storage.local.get('token');
     if (!token) throw new Error('Connect first to view daemon history.');
-    const response = await readDaemonResponse(await fetch('http://127.0.0.1:43121/history', {
+    const response = await daemonRequest('/history', {
       headers: {authorization: `Bearer ${token}`}
-    }));
+    });
     renderToolHistory(Array.isArray(response.items) ? response.items as DaemonHistoryItem[] : []);
   } catch (error) {
     if (indicatorRefs) indicatorRefs.historyList.textContent = `History unavailable: ${(error as Error).message}`;
@@ -1448,12 +1460,25 @@ async function updateStatus(state: string, message: string) {
   await chrome.storage.local.set({agentStatus: status});
 }
 
-async function readDaemonResponse(response: Response) {
-  const body = await response.json() as Record<string, unknown>;
-  if (!response.ok) {
-    throw new Error(String(body.error || `Daemon returned status ${response.status}.`));
+async function daemonRequest(path: string, options: {
+  method?: 'GET' | 'POST';
+  headers?: Record<string, string>;
+  body?: unknown;
+} = {}) {
+  const response = await chrome.runtime.sendMessage({
+    type: 'daemon-request',
+    path,
+    method: options.method || 'GET',
+    headers: options.headers,
+    body: options.body
+  }) as {ok?: boolean; status?: number; body?: unknown; error?: string} | undefined;
+  if (!response) {
+    throw new Error('The extension background worker did not respond.');
   }
-  return body;
+  if (response.ok !== true) {
+    throw new Error(String(response.error || `Daemon returned status ${response.status || 0}.`));
+  }
+  return (response.body || {}) as Record<string, unknown>;
 }
 
 function extensionContextWasInvalidated(error: unknown) {
@@ -1487,21 +1512,21 @@ async function connectAgent() {
       throw new Error('Open the extension popup once to save a pairing token and project path.');
     }
 
-    const connection = await readDaemonResponse(await fetch('http://127.0.0.1:43121/connect', {
+    const connection = await daemonRequest('/connect', {
       method: 'POST',
       headers: {'content-type': 'application/json'},
-      body: JSON.stringify({token})
-    }));
+      body: {token}
+    });
     if (connection.ok !== true) throw new Error(String(connection.error || 'Connection failed.'));
 
-    const workspaceResult = await readDaemonResponse(await fetch('http://127.0.0.1:43121/workspace', {
+    const workspaceResult = await daemonRequest('/workspace', {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
         authorization: `Bearer ${token}`
       },
-      body: JSON.stringify({path: workspace})
-    }));
+      body: {path: workspace}
+    });
     if (workspaceResult.ok !== true) throw new Error(String(workspaceResult.error || 'Workspace setup failed.'));
 
     const connectedWorkspace = String(workspaceResult.workspace || workspace);
@@ -1585,11 +1610,21 @@ async function pollShellJob(toolCallId: string, token: string) {
   const stillRunning = () => agentRunning && generation === agentRunGeneration;
 
   while (stillRunning()) {
-    let response: Response;
     try {
-      response = await fetch(`http://127.0.0.1:43121/tool/${encodeURIComponent(toolCallId)}`, {
+      const result = await daemonRequest(`/tool/${encodeURIComponent(toolCallId)}`, {
         headers: {authorization: `Bearer ${token}`}
       });
+      if (result.pending !== true) return result;
+
+      const startedAt = Date.parse(String(result.started_at || ''));
+      const elapsedSeconds = Number.isFinite(startedAt)
+        ? Math.max(0, Math.floor((Date.now() - startedAt) / 1000))
+        : 0;
+      await updateStatus(
+        'background',
+        `run_command ${toolCallId} is running in the background (${elapsedSeconds}s). Waiting for completion.`
+      );
+      await new Promise(resolve => setTimeout(resolve, SHELL_JOB_POLL_MS));
     } catch (error) {
       await updateStatus(
         'background',
@@ -1598,19 +1633,6 @@ async function pollShellJob(toolCallId: string, token: string) {
       await new Promise(resolve => setTimeout(resolve, SHELL_JOB_POLL_MS));
       continue;
     }
-
-    const result = await readDaemonResponse(response);
-    if (result.pending !== true) return result;
-
-    const startedAt = Date.parse(String(result.started_at || ''));
-    const elapsedSeconds = Number.isFinite(startedAt)
-      ? Math.max(0, Math.floor((Date.now() - startedAt) / 1000))
-      : 0;
-    await updateStatus(
-      'background',
-      `run_command ${toolCallId} is running in the background (${elapsedSeconds}s). Waiting for completion.`
-    );
-    await new Promise(resolve => setTimeout(resolve, SHELL_JOB_POLL_MS));
   }
 
   throw new Error(`Local agent stopped while ${toolCallId} is still running in the background.`);
@@ -1635,14 +1657,14 @@ async function execute(call: ToolCall, callId: string, candidateId: string) {
     await updateStatus('executing', `${call.name} approved (${callId}). Running locally.`);
   }
 
-  const result = await readDaemonResponse(await fetch('http://127.0.0.1:43121/tool', {
+  const result = await daemonRequest('/tool', {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
       authorization: `Bearer ${token}`
     },
-    body: JSON.stringify({name: call.name, arguments: call.arguments || {}, tool_call_id: callId})
-  }));
+    body: {name: call.name, arguments: call.arguments || {}, tool_call_id: callId}
+  });
 
   if (call.name === 'run_command' && result.pending === true) {
     savePendingShellJob({
@@ -1834,6 +1856,7 @@ function scheduleCompletionBridgeReconnect() {
   if (!agentRunning || !completionBridgeProvider() || completionBridgeReconnectTimer) return;
   const delay = Math.min(COMPLETION_BRIDGE_RECONNECT_MAX_MS, 500 * (2 ** completionBridgeReconnectAttempt));
   completionBridgeReconnectAttempt += 1;
+  bridgeLog('reconnect.scheduled', {attempt: completionBridgeReconnectAttempt, delay_ms: delay});
   completionBridgeReconnectTimer = window.setTimeout(() => {
     completionBridgeReconnectTimer = 0;
     void openCompletionBridge();
@@ -1843,6 +1866,7 @@ function scheduleCompletionBridgeReconnect() {
 function cancelActiveBridgeCompletion(message = 'Completion bridge disconnected.') {
   const completion = activeBridgeCompletion;
   if (!completion) return;
+  bridgeLog('completion.cancelled', {request_id: completion.id, message});
   activeBridgeCompletion = null;
   findProviderStopControl()?.click();
   void suppressCompletedBridgeResponse();
@@ -2169,7 +2193,10 @@ function handleCompletionBridgeMessage(event: MessageEvent<string>) {
 async function openCompletionBridge() {
   const provider = completionBridgeProvider();
   if (!agentRunning || !provider) return;
-  if (completionBridgeSocket && completionBridgeSocket.readyState <= WebSocket.OPEN) return;
+  if (completionBridgeSocket && completionBridgeSocket.readyState <= WebSocket.OPEN) {
+    bridgeLog('socket.reuse', {provider, ready_state: completionBridgeSocket.readyState});
+    return;
+  }
 
   const {token} = await chrome.storage.local.get('token');
   const pairingToken = String(token || '').trim();
@@ -2178,8 +2205,10 @@ async function openCompletionBridge() {
   clearCompletionBridgeTimers();
   let socket: WebSocket;
   try {
+    bridgeLog('socket.opening', {provider});
     socket = new WebSocket(COMPLETION_BRIDGE_URL, [COMPLETION_BRIDGE_PROTOCOL, `token.${pairingToken}`]);
   } catch {
+    bridgeLog('socket.open.failed', {provider});
     scheduleCompletionBridgeReconnect();
     return;
   }
@@ -2188,6 +2217,7 @@ async function openCompletionBridge() {
   socket.addEventListener('open', () => {
     if (completionBridgeSocket !== socket) return;
     completionBridgeReconnectAttempt = 0;
+    bridgeLog('socket.open', {provider});
     sendCompletionBridgeMessage({
       type: 'bridge.register',
       client_id: completionBridgeClientId(),
@@ -2199,14 +2229,32 @@ async function openCompletionBridge() {
     }, 20_000);
   });
 
-  socket.addEventListener('message', handleCompletionBridgeMessage as EventListener);
+  socket.addEventListener('message', event => {
+    try {
+      const message = JSON.parse(String(event.data)) as {type?: string; client_id?: string; provider?: string; request_id?: string; error?: string};
+      bridgeLog('socket.message', {
+        message_type: message.type || null,
+        request_id: message.request_id || null,
+        client_id: message.client_id || null,
+        provider: message.provider || provider,
+        error: message.error || null
+      });
+    } catch {
+      bridgeLog('socket.message.invalid');
+    }
+    handleCompletionBridgeMessage(event as MessageEvent<string>);
+  });
   socket.addEventListener('close', () => {
     if (completionBridgeSocket !== socket) return;
+    bridgeLog('socket.close', {provider, ready_state: socket.readyState});
     completionBridgeSocket = null;
     if (completionBridgeHeartbeatTimer) window.clearInterval(completionBridgeHeartbeatTimer);
     completionBridgeHeartbeatTimer = 0;
     cancelActiveBridgeCompletion();
     scheduleCompletionBridgeReconnect();
+  });
+  socket.addEventListener('error', () => {
+    bridgeLog('socket.error', {provider, ready_state: socket.readyState});
   });
 }
 

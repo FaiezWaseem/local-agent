@@ -11,6 +11,7 @@ export default defineConfig({
     emptyOutDir: true,
     rollupOptions: {
       input: {
+        background: resolve(rootDir, 'src/background.ts'),
         content: resolve(rootDir, 'src/content.ts'),
         'deepseek-stream': resolve(rootDir, 'src/deepseek-stream.ts'),
         'zai-stream': resolve(rootDir, 'src/zai-stream.ts'),
