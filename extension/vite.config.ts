@@ -15,7 +15,8 @@ export default defineConfig({
         content: resolve(rootDir, 'src/content.ts'),
         'deepseek-stream': resolve(rootDir, 'src/deepseek-stream.ts'),
         'zai-stream': resolve(rootDir, 'src/zai-stream.ts'),
-        popup: resolve(rootDir, 'popup.html')
+        popup: resolve(rootDir, 'popup.html'),
+        sidepanel: resolve(rootDir, 'sidepanel.html')
       },
       output: {
         entryFileNames: '[name].js'

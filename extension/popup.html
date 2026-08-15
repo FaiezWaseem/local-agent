@@ -34,6 +34,12 @@
       font: 13px/1.45 "Aptos", "Trebuchet MS", sans-serif;
     }
 
+    body[data-surface="sidepanel"] {
+      width: auto;
+      min-width: 320px;
+      min-height: 100vh;
+    }
+
     body::before {
       position: fixed;
       inset: 0;
@@ -58,6 +64,11 @@
     .app {
       position: relative;
       padding: 18px;
+    }
+
+    body[data-surface="sidepanel"] .app {
+      min-height: 100vh;
+      padding: 20px;
     }
 
     .masthead {
@@ -192,9 +203,13 @@
 
     .actions {
       display: grid;
-      grid-template-columns: 1.45fr 1fr 0.8fr;
+      grid-template-columns: 1.25fr 1fr 0.8fr 1fr;
       gap: 7px;
       margin-top: 13px;
+    }
+
+    body[data-surface="sidepanel"] .actions {
+      grid-template-columns: 1.4fr 1fr 0.9fr;
     }
 
     .button {
@@ -221,6 +236,14 @@
 
     .button.primary:hover { background: var(--accent-dark); }
     .button:disabled { cursor: wait; opacity: 0.65; transform: none; }
+
+    #openSidebar {
+      white-space: nowrap;
+    }
+
+    body[data-surface="sidepanel"] #openSidebar {
+      display: none;
+    }
 
     .prompt-card {
       border-color: rgba(24, 35, 31, 0.82);
@@ -563,6 +586,7 @@
         <button id="save" class="button primary" type="button">Connect</button>
         <button id="attach" class="button" type="button">Attach tab</button>
         <button id="health" class="button" type="button">Check</button>
+        <button id="openSidebar" class="button" type="button">Sidebar</button>
       </div>
     </section>
 

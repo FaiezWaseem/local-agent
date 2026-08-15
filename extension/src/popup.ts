@@ -52,8 +52,12 @@ const resultDelayEl = $('#resultDelay') as HTMLSelectElement;
 const initialPromptEl = $('#initialPrompt') as HTMLTextAreaElement;
 const copyPromptEl = $('#copyPrompt') as HTMLButtonElement;
 const attachEl = $('#attach') as HTMLButtonElement;
+const openSidebarEl = $('#openSidebar') as HTMLButtonElement | null;
 const toastEl = $('#toast');
 const toastTextEl = $('#toastText');
+
+const surface = new URLSearchParams(location.search).get('surface') === 'sidepanel' ? 'sidepanel' : 'popup';
+document.body.dataset.surface = surface;
 
 initialPromptEl.value = INITIAL_PROMPT;
 
@@ -115,6 +119,18 @@ function showToast(text: string, tone: StatusTone = 'neutral', durationMs = 2200
     toastEl.dataset.open = 'false';
     toastTimer = 0;
   }, durationMs);
+}
+
+async function openSidebar() {
+  if (!chrome.sidePanel) {
+    throw new Error('Chrome side panel is not available in this browser.');
+  }
+  const [tab] = await chrome.tabs.query({active: true, currentWindow: true});
+  if (!tab?.windowId) {
+    throw new Error('Could not find the current Chrome window.');
+  }
+  await chrome.sidePanel.open({windowId: tab.windowId});
+  showToast('Sidebar opened. You can resize it from Chrome.', 'success');
 }
 
 function setConnected(connected: boolean) {
@@ -418,6 +434,24 @@ copyPromptEl.addEventListener('click', async () => {
     window.setTimeout(() => {
       copyPromptEl.textContent = idleLabel;
     }, 1400);
+  }
+});
+
+openSidebarEl?.addEventListener('click', async () => {
+  const idleLabel = openSidebarEl.textContent || 'Sidebar';
+  try {
+    openSidebarEl.disabled = true;
+    openSidebarEl.textContent = 'Opening...';
+    setStatus('Opening the extension sidebar...', 'busy');
+    await openSidebar();
+    setStatus('Sidebar opened. Chrome controls its width, and the same cards are now available there.', 'success');
+  } catch (error) {
+    const message = (error as Error).message;
+    setStatus(message, 'error');
+    showToast(message, 'error', 3000);
+  } finally {
+    openSidebarEl.disabled = false;
+    openSidebarEl.textContent = idleLabel;
   }
 });
 
