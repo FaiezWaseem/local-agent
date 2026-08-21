@@ -21,6 +21,7 @@ type StatusTone = 'neutral' | 'busy' | 'success' | 'error';
 
 const CHAT_PROVIDERS: Record<string, string> = {
   'chatgpt.com': 'ChatGPT',
+  'www.chatgpt.com': 'ChatGPT',
   'chat.openai.com': 'ChatGPT',
   'chat.deepseek.com': 'DeepSeek',
   'chat.qwen.ai': 'Qwen',
@@ -28,10 +29,19 @@ const CHAT_PROVIDERS: Record<string, string> = {
 };
 const STREAM_SCRIPTS: Record<string, string> = {
   'chatgpt.com': 'chatgpt-stream.js',
+  'www.chatgpt.com': 'chatgpt-stream.js',
   'chat.openai.com': 'chatgpt-stream.js',
   'chat.deepseek.com': 'deepseek-stream.js',
   'chat.z.ai': 'zai-stream.js'
 };
+const CHAT_TAB_URLS = [
+  'https://chatgpt.com/*',
+  'https://*.chatgpt.com/*',
+  'https://chat.openai.com/*',
+  'https://chat.deepseek.com/*',
+  'https://chat.qwen.ai/*',
+  'https://chat.z.ai/*'
+];
 const DEFAULT_SUBMISSION_DELAY_MS = 8000;
 const SUBMISSION_DELAY_OPTIONS = new Set([5000, 8000, 12000, 20000, 30000]);
 const EMPTY_POLICY: ApprovalPolicy = {edits: false, deletes: false, shell: false};
@@ -245,15 +255,10 @@ async function call(url: string, body?: unknown) {
   return readJson(response);
 }
 
-async function attachToActiveTab() {
-  const [tab] = await chrome.tabs.query({active: true, currentWindow: true});
-  if (!tab?.id) {
-    throw new Error('Open ChatGPT, DeepSeek, Qwen, or Z.ai in this window first.');
-  }
+async function attachChatTab(tab: chrome.tabs.Tab) {
+  if (!tab.id || !tab.url) return;
   const provider = providerForUrl(tab.url);
-  if (!provider) {
-    throw new Error('The active tab is not a supported AI chat.');
-  }
+  if (!provider) return;
 
   const streamFile = STREAM_SCRIPTS[provider.url.hostname];
   if (streamFile) {
@@ -268,6 +273,33 @@ async function attachToActiveTab() {
     target: {tabId: tab.id},
     files: ['content.js']
   });
+
+  try {
+    await chrome.tabs.sendMessage(tab.id, {type: 'ensure-bridge'});
+  } catch {
+    // The injected content script opens the bridge during init.
+  }
+}
+
+async function attachToActiveTab() {
+  const chatTabs = await chrome.tabs.query({url: CHAT_TAB_URLS});
+  const [activeTab] = await chrome.tabs.query({active: true, currentWindow: true});
+  const tabs = chatTabs.length
+    ? chatTabs
+    : activeTab
+      ? [activeTab]
+      : [];
+
+  if (!tabs.length) {
+    throw new Error('Open ChatGPT, DeepSeek, Qwen, or Z.ai in this window first.');
+  }
+  if (!tabs.some(tab => providerForUrl(tab.url))) {
+    throw new Error('The active tab is not a supported AI chat.');
+  }
+
+  for (const tab of tabs) {
+    await attachChatTab(tab);
+  }
 
   await new Promise(resolve => setTimeout(resolve, 150));
   const {agentStatus} = await chrome.storage.local.get('agentStatus');

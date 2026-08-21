@@ -428,7 +428,8 @@ export function installCompletionBridge(app: FastifyInstance, token: string) {
     publish('bridge.select.inspect', {
       model,
       requested_provider: providerForModel(model) || 'auto',
-      matching_clients: matches.map(clientSnapshot)
+      matching_clients: matches.map(clientSnapshot),
+      connected_clients: [...clients].map(clientSnapshot)
     });
     return matches.find(client => (
       !client.busy
@@ -440,7 +441,7 @@ export function installCompletionBridge(app: FastifyInstance, token: string) {
     const matches = matchingClients(model);
     if (!matches.length) {
       return {
-        message: `No extension tab is connected for model ${model}.`,
+        message: `No extension tab is connected for model ${model}. Open the matching chat, click Connect on the in-page Local AI Agent monitor, and keep that tab open. Popup Connected is not enough — the daemon log must show bridge.connected with provider ${providerForModel(model) || 'auto'}.`,
         code: 'bridge_unavailable'
       };
     }
@@ -513,6 +514,11 @@ export function installCompletionBridge(app: FastifyInstance, token: string) {
     }
     return {item, promise};
   };
+
+  app.get('/v1/bridge', async () => ({
+    object: 'list',
+    data: [...clients].filter(client => client.provider).map(clientSnapshot)
+  }));
 
   app.get('/v1/models', async () => {
     const now = Math.floor(Date.now() / 1000);
