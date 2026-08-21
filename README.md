@@ -1,6 +1,6 @@
 # Local AI Agent
 
-Experimental Chrome extension + localhost Node daemon that gives DeepSeek, Qwen, and Z.ai **approved** local coding tools.
+Experimental Chrome extension + localhost Node daemon that gives ChatGPT, DeepSeek, Qwen, and Z.ai **approved** local coding tools.
 
 ## Features
 - Automatic `<tool_call>` detection with a shared 5-30 second provider cooldown for API prompts and tool replies
@@ -10,7 +10,7 @@ Experimental Chrome extension + localhost Node daemon that gives DeepSeek, Qwen,
 - Draggable in-page activity monitor with an active-tool command line, live send-countdown states, and expandable input/output history
 - Direct Connect and Stop controls in the floating monitor, scoped to the current tab
 - Automatic failure results so the model can correct malformed or failed tool calls
-- Strict tool-protocol reinforcement on every outgoing DeepSeek, Qwen, and Z.ai message, including a ban on provider-native tools
+- Strict tool-protocol reinforcement on every outgoing ChatGPT, DeepSeek, Qwen, and Z.ai message, including a ban on provider-native tools
 - Provider-wide recovery for wrapped, fenced, and renderer-stripped JSON tool calls
 - Schema-aware recovery when chat rendering removes JSON escapes from large `edit_file` or `write_file` code strings
 - Copy-ready initial prompt in the extension popup
@@ -36,7 +36,7 @@ npm run build
 DEEPSEEK_WORKSPACE=/absolute/path/to/project npm start
 ```
 
-The daemon prints a pairing token. In Chrome open `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and select `extension/dist`. Open `https://chat.deepseek.com/`, `https://chat.qwen.ai/`, or `https://chat.z.ai/`, then open the extension popup, paste the token and absolute project path, and click **Connect**. If the chat tab was already open before the extension loaded, click **Attach Tab** once. After connecting, approval switches can be applied to the current project or to every project used by this browser profile.
+The daemon prints a pairing token. In Chrome open `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and select `extension/dist`. Open `https://chatgpt.com/`, `https://chat.deepseek.com/`, `https://chat.qwen.ai/`, or `https://chat.z.ai/`, then open the extension popup, paste the token and absolute project path, and click **Connect**. If the chat tab was already open before the extension loaded, click **Attach Tab** once. After connecting, approval switches can be applied to the current project or to every project used by this browser profile.
 
 ### Standalone Windows daemon
 
@@ -49,7 +49,7 @@ npm run build:exe
 Share `release/local-ai-agent-windows-x64.exe`. The recipient does not need Node.js, npm, or Bun. Run the executable, keep its console window open, and use the printed pairing token in the extension popup. The popup sets the active project path after connecting.
 
 ## Chat instruction
-DeepSeek, Qwen, and Z.ai receive the strict V4 protocol automatically with every outgoing message. It explicitly disables provider-native tools, requires local calls to be emitted as literal assistant text, and explains delayed shell results. The equivalent protocol is:
+ChatGPT, DeepSeek, Qwen, and Z.ai receive the strict V4 protocol automatically with every outgoing message. It explicitly disables provider-native tools, requires local calls to be emitted as literal assistant text, and explains delayed shell results. The equivalent protocol is:
 
 ```text
 Never invoke native or built-in provider tools. The only permitted tools are read_file, write_file, edit_file, delete_file, list_directory, run_command, git_status, git_diff, and git_log.
@@ -62,32 +62,30 @@ Then ask: `Inspect this project and explain its structure.`
 
 ## OpenAI-compatible API
 
-Keep a connected DeepSeek or Z.ai chat tab open. Use the daemon URL as the OpenAI base URL and the printed pairing token as the API key:
+Keep a connected ChatGPT, DeepSeek, or Z.ai chat tab open. Use the daemon URL as the OpenAI base URL. `/v1/models`, `/v1/chat/completions`, and `/v1/events` do not require an API key; the pairing token is only for the extension.
 
 ```text
 Base URL: http://127.0.0.1:43121/v1
-API key:  <pairing token>
-Models:   deepseek-web, glm-web, auto
+API key:  any value, or omit
+Models:   chatgpt-web, deepseek-web, glm-web, auto
 ```
 
 Streaming example:
 
 ```bash
 curl -N http://127.0.0.1:43121/v1/chat/completions \
-  -H "Authorization: Bearer <pairing token>" \
   -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-web","stream":true,"messages":[{"role":"user","content":"Explain this project briefly."}]}'
+  -d '{"model":"chatgpt-web","stream":true,"messages":[{"role":"user","content":"Explain this project briefly."}]}'
 ```
 
-The daemon sends each request over an authenticated localhost WebSocket to an idle matching provider tab. The extension submits the conversation through the provider UI and returns normalized OpenAI `chat.completion.chunk` events followed by `data: [DONE]`. Only DeepSeek and Z.ai currently expose direct response streams; Qwen remains available for local tools but is not advertised by `/v1/models`.
+The daemon sends each request over an authenticated localhost WebSocket to an idle matching provider tab. The extension submits the conversation through the provider UI and returns normalized OpenAI `chat.completion.chunk` events followed by `data: [DONE]`. `/v1/models` always lists `auto`, `chatgpt-web`, `deepseek-web`, and `glm-web`; a completion still needs an open, connected tab for that provider. Qwen remains available for local tools but is not a completion-bridge model.
 
 OpenAI function tools are supported through `tools` and `tool_choice` (`auto`, `none`, `required`, or a forced function). A provider tool envelope is normalized to `message.tool_calls` for regular responses or `delta.tool_calls` for streams, with `finish_reason: "tool_calls"`. Send the assistant call and its result back in the next request using `role: "tool"` and the returned `tool_call_id`. The browser bridge emits at most one function call per completion; clients can continue calling tools over successive requests.
 
-Real-time diagnostic events are available with the same bearer token:
+Real-time diagnostic events:
 
 ```bash
-curl -N http://127.0.0.1:43121/v1/events \
-  -H "Authorization: Bearer <pairing token>"
+curl -N http://127.0.0.1:43121/v1/events
 ```
 
 Diagnostics omit prompt and response content by default. Add `?include_content=1` only when full response deltas are needed for local debugging.

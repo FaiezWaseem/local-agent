@@ -1,5 +1,7 @@
 type AgentWindow = Window & {
   __deepseekLocalAgentLoaded?: boolean;
+  __localAiAgentPing?: () => string;
+  __localAiAgentEnsureBridge?: () => void;
 };
 
 type ToolCall = {
@@ -138,18 +140,24 @@ const TOOL_BLOCK_OPEN = '<tool_call>';
 const TOOL_BLOCK_CLOSE = '</tool_call>';
 const LABELED_TOOL_RE = /(?:^|\n)\s*(?:\*\*)?Call Tool:(?:\*\*)?\s*([A-Za-z_][\w-]*)\s*(?:\n|$)\s*(?:\*\*)?Arguments:(?:\*\*)?\s*([\s\S]*?)(?=(?:\n\s*(?:\*\*)?Call Tool:)|$)/gi;
 const CHAT_PROVIDER_NAMES: Record<string, string> = {
+  'chatgpt.com': 'ChatGPT',
+  'www.chatgpt.com': 'ChatGPT',
+  'chat.openai.com': 'ChatGPT',
   'chat.deepseek.com': 'DeepSeek',
   'chat.qwen.ai': 'Qwen',
   'chat.z.ai': 'Z.ai'
 };
 const DEEPSEEK_STREAM_EVENT = 'local-ai-agent:deepseek-answer';
 const ZAI_STREAM_EVENT = 'local-ai-agent:zai-answer';
+const CHATGPT_STREAM_EVENT = 'local-ai-agent:chatgpt-answer';
 const PROVIDER_STREAM_STATE_EVENT = 'local-ai-agent:provider-stream-state';
 const PROVIDER_STREAM_DELTA_EVENT = 'local-ai-agent:provider-stream-delta';
 const COMPLETION_BRIDGE_URL = 'ws://127.0.0.1:43121/ws/extension';
 const COMPLETION_BRIDGE_PROTOCOL = 'local-ai-agent';
 const COMPLETION_BRIDGE_CLIENT_KEY = 'local-ai-agent-completion-bridge-client';
 const COMPLETION_BRIDGE_RECONNECT_MAX_MS = 15_000;
+const COMPLETION_BRIDGE_WATCHDOG_MS = 3_000;
+const COMPLETION_BRIDGE_CONNECTING_TIMEOUT_MS = 4_000;
 const TAB_PAUSED_KEY = 'local-ai-agent-paused';
 const PENDING_SHELL_JOBS_KEY = 'local-ai-agent-pending-shell-jobs';
 const SHELL_JOB_POLL_MS = 2000;
@@ -231,6 +239,8 @@ let completionBridgeSocket: WebSocket | null = null;
 let completionBridgeReconnectTimer = 0;
 let completionBridgeHeartbeatTimer = 0;
 let completionBridgeReconnectAttempt = 0;
+let completionBridgeConnectingAt = 0;
+let completionBridgeWatchdogTimer = 0;
 let activeBridgeCompletion: ActiveBridgeCompletion | null = null;
 let bridgeResponseSuppressionActive = false;
 
@@ -250,9 +260,17 @@ function chatProviderName() {
   return CHAT_PROVIDER_NAMES[location.hostname] || 'AI chat';
 }
 
+function isChatGptHost(hostname = location.hostname) {
+  return hostname === 'chatgpt.com'
+    || hostname === 'www.chatgpt.com'
+    || hostname === 'chat.openai.com'
+    || hostname.endsWith('.chatgpt.com');
+}
+
 function completionBridgeProvider() {
   if (location.hostname === 'chat.deepseek.com') return 'deepseek';
   if (location.hostname === 'chat.z.ai') return 'zai';
+  if (isChatGptHost()) return 'chatgpt';
   return undefined;
 }
 
@@ -1264,7 +1282,9 @@ function installProviderStreamBridge() {
     ? DEEPSEEK_STREAM_EVENT
     : location.hostname === 'chat.z.ai'
       ? ZAI_STREAM_EVENT
-      : undefined;
+      : isChatGptHost()
+        ? CHATGPT_STREAM_EVENT
+        : undefined;
   if (!streamEvent) return;
 
   document.addEventListener(PROVIDER_STREAM_STATE_EVENT, event => {
@@ -1681,6 +1701,18 @@ async function execute(call: ToolCall, callId: string, candidateId: string) {
 }
 
 function findComposer(): HTMLElement | null {
+  if (isChatGptHost()) {
+    const prompt = document.getElementById('prompt-textarea');
+    if (
+      prompt instanceof HTMLElement
+      && isVisible(prompt)
+      && prompt.getAttribute('aria-hidden') !== 'true'
+      && prompt.getAttribute('aria-disabled') !== 'true'
+    ) {
+      return prompt;
+    }
+  }
+
   const candidates = [...document.querySelectorAll(
     'textarea,[contenteditable="true"],[contenteditable="plaintext-only"],[role="textbox"]'
   )] as HTMLElement[];
@@ -1697,7 +1729,7 @@ function findComposer(): HTMLElement | null {
   }).sort((left, right) => {
     const score = (element: HTMLElement) => {
       const label = `${element.getAttribute('aria-label') || ''} ${element.getAttribute('placeholder') || ''}`;
-      const chatHint = /message|ask|prompt|qwen|deepseek|glm/i.test(label) ? 5000 : 0;
+      const chatHint = /message|ask|prompt|qwen|deepseek|glm|chatgpt|openai/i.test(label) ? 5000 : 0;
       const editorHint = element instanceof HTMLTextAreaElement || element.isContentEditable ? 10000 : 0;
       return chatHint + editorHint + element.getBoundingClientRect().bottom;
     };
@@ -1739,12 +1771,15 @@ function resultIsPending() {
 }
 
 function findProviderStopControl() {
+  const stopButton = document.querySelector<HTMLElement>('[data-testid="stop-button"]');
+  if (stopButton && isVisible(stopButton)) return stopButton;
+
   const controls = [...document.querySelectorAll<HTMLElement>('button,[role="button"]')];
   return controls.find(control => {
     if (!isVisible(control)) return false;
     const label = controlLabel(control).trim();
     return /^(?:(?:stop|cancel)\s*)+$/i.test(label)
-      || /\b(stop|cancel)\s+(generating|generation|response)\b/i.test(label);
+      || /\b(stop|cancel)\s+(generating|generation|response|streaming)\b/i.test(label);
   }) || null;
 }
 
@@ -1797,7 +1832,10 @@ function findSendControl(composer: HTMLElement) {
   for (let depth = 0; root && depth < 7; depth += 1, root = root.parentElement) {
     const controls = [...root.querySelectorAll('button,[role="button"]')] as HTMLElement[];
     const candidates = controls.filter(isClickable);
-    const explicit = candidates.find(candidate => /\b(send|submit)\b/i.test(controlLabel(candidate)));
+    const explicit = candidates.find(candidate => (
+      candidate.getAttribute('data-testid') === 'send-button'
+      || /\b(send|submit)\b/i.test(controlLabel(candidate))
+    ));
     if (explicit) return explicit;
 
     const likely = candidates.filter(candidate => {
@@ -1850,6 +1888,10 @@ function clearCompletionBridgeTimers() {
   if (completionBridgeHeartbeatTimer) window.clearInterval(completionBridgeHeartbeatTimer);
   completionBridgeReconnectTimer = 0;
   completionBridgeHeartbeatTimer = 0;
+}
+
+function bridgeSocketIsOpen() {
+  return completionBridgeSocket?.readyState === WebSocket.OPEN;
 }
 
 function scheduleCompletionBridgeReconnect() {
@@ -2193,9 +2235,14 @@ function handleCompletionBridgeMessage(event: MessageEvent<string>) {
 async function openCompletionBridge() {
   const provider = completionBridgeProvider();
   if (!agentRunning || !provider) return;
-  if (completionBridgeSocket && completionBridgeSocket.readyState <= WebSocket.OPEN) {
-    bridgeLog('socket.reuse', {provider, ready_state: completionBridgeSocket.readyState});
+  if (bridgeSocketIsOpen()) {
+    bridgeLog('socket.reuse', {provider, ready_state: completionBridgeSocket?.readyState});
     return;
+  }
+  if (completionBridgeSocket?.readyState === WebSocket.CONNECTING) {
+    if (completionBridgeConnectingAt && Date.now() - completionBridgeConnectingAt < COMPLETION_BRIDGE_CONNECTING_TIMEOUT_MS) return;
+    try { completionBridgeSocket.close(); } catch { /* replace a stuck CONNECTING socket */ }
+    completionBridgeSocket = null;
   }
 
   const {token} = await chrome.storage.local.get('token');
@@ -2213,9 +2260,11 @@ async function openCompletionBridge() {
     return;
   }
   completionBridgeSocket = socket;
+  completionBridgeConnectingAt = Date.now();
 
   socket.addEventListener('open', () => {
     if (completionBridgeSocket !== socket) return;
+    completionBridgeConnectingAt = 0;
     completionBridgeReconnectAttempt = 0;
     bridgeLog('socket.open', {provider});
     sendCompletionBridgeMessage({
@@ -2248,6 +2297,7 @@ async function openCompletionBridge() {
     if (completionBridgeSocket !== socket) return;
     bridgeLog('socket.close', {provider, ready_state: socket.readyState});
     completionBridgeSocket = null;
+    completionBridgeConnectingAt = 0;
     if (completionBridgeHeartbeatTimer) window.clearInterval(completionBridgeHeartbeatTimer);
     completionBridgeHeartbeatTimer = 0;
     cancelActiveBridgeCompletion();
@@ -2255,6 +2305,55 @@ async function openCompletionBridge() {
   });
   socket.addEventListener('error', () => {
     bridgeLog('socket.error', {provider, ready_state: socket.readyState});
+  });
+}
+
+function previousAgentInstanceIsAlive() {
+  try {
+    return agentWindow.__localAiAgentPing?.() === 'ok';
+  } catch {
+    return false;
+  }
+}
+
+function claimAgentWindow() {
+  agentWindow.__deepseekLocalAgentLoaded = true;
+  agentWindow.__localAiAgentPing = () => {
+    chrome.runtime.getURL('content.js');
+    return 'ok';
+  };
+  agentWindow.__localAiAgentEnsureBridge = () => {
+    void openCompletionBridge();
+  };
+}
+
+function installCompletionBridgeWatchdog() {
+  if (completionBridgeWatchdogTimer) return;
+  completionBridgeWatchdogTimer = window.setInterval(() => {
+    if (!agentRunning || !completionBridgeProvider() || bridgeSocketIsOpen()) return;
+    void openCompletionBridge();
+  }, COMPLETION_BRIDGE_WATCHDOG_MS);
+
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) void openCompletionBridge();
+  });
+  window.addEventListener('pageshow', () => {
+    void openCompletionBridge();
+  });
+  window.addEventListener('focus', () => {
+    void openCompletionBridge();
+  });
+
+  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if ((message as {type?: string} | undefined)?.type !== 'ensure-bridge') return undefined;
+    void openCompletionBridge();
+    sendResponse({
+      ok: true,
+      agentRunning,
+      provider: completionBridgeProvider() || null,
+      readyState: completionBridgeSocket?.readyState ?? null
+    });
+    return true;
   });
 }
 
@@ -3013,12 +3112,13 @@ function installConnectionStorageSync() {
 async function init() {
   await ensureIndicator();
 
-  if (agentWindow.__deepseekLocalAgentLoaded) {
+  if (previousAgentInstanceIsAlive()) {
+    agentWindow.__localAiAgentEnsureBridge?.();
     await updateStatus('attached', 'Content script already attached to this tab. Use Connect or Stop here.');
     return;
   }
 
-  agentWindow.__deepseekLocalAgentLoaded = true;
+  claimAgentWindow();
   const connection = await chrome.storage.local.get(['token', 'workspace', 'connectedWorkspace']);
   const activeWorkspace = connection.connectedWorkspace || connection.workspace;
   protocolReinforcementEnabled = !tabIsPaused();
@@ -3027,6 +3127,7 @@ async function init() {
   installProtocolReinforcement();
   installProviderStreamBridge();
   installConnectionStorageSync();
+  installCompletionBridgeWatchdog();
 
   new MutationObserver(() => queueScan()).observe(document.documentElement, {
     subtree: true,

@@ -104,4 +104,48 @@ assert.deepEqual(
   ['started', 'finished']
 );
 
-console.log('DeepSeek and Z.ai stream regressions: PASS');
+const chatGptDelta = [
+  {v: {message: {author: {role: 'assistant'}, content: {content_type: 'text', parts: ['']}, status: 'in_progress'}}},
+  {v: 'Hello'},
+  {v: ' world'},
+  {p: '/message/status', o: 'replace', v: 'finished_successfully'}
+].map(value => `event: delta\ndata: ${JSON.stringify(value)}\n\n`).join('');
+const chatGpt = bridgeContext('https://chatgpt.com/', async () => {
+  const response = new Response(chatGptDelta, {status: 200});
+  Object.defineProperty(response, 'url', {value: 'https://chatgpt.com/backend-api/f/conversation'});
+  return response;
+});
+loadBridge(chatGpt.context, 'chatgpt-stream.js');
+await chatGpt.context.fetch('https://chatgpt.com/backend-api/f/conversation');
+await new Promise(resolve => setTimeout(resolve, 25));
+assert.deepEqual(
+  chatGpt.events.filter(event => event.type === 'local-ai-agent:provider-stream-delta').map(event => event.detail),
+  ['Hello', ' world']
+);
+assert.equal(
+  chatGpt.events.find(event => event.type === 'local-ai-agent:chatgpt-answer')?.detail,
+  'Hello world'
+);
+assert.deepEqual(
+  chatGpt.events.filter(event => event.type === 'local-ai-agent:provider-stream-state').map(event => event.detail),
+  ['started', 'finished']
+);
+
+const chatGptClassicBody = [
+  {message: {author: {role: 'assistant'}, content: {content_type: 'text', parts: ['Hello']}, status: 'in_progress'}},
+  {message: {author: {role: 'assistant'}, content: {content_type: 'text', parts: ['Hello world']}, status: 'finished_successfully'}}
+].map(value => `data: ${JSON.stringify(value)}\n\n`).join('') + 'data: [DONE]\n\n';
+const chatGptClassic = bridgeContext('https://chat.openai.com/', async () => {
+  const response = new Response(chatGptClassicBody, {status: 200});
+  Object.defineProperty(response, 'url', {value: 'https://chat.openai.com/backend-api/conversation'});
+  return response;
+});
+loadBridge(chatGptClassic.context, 'chatgpt-stream.js');
+await chatGptClassic.context.fetch('https://chat.openai.com/backend-api/conversation');
+await new Promise(resolve => setTimeout(resolve, 25));
+assert.equal(
+  chatGptClassic.events.find(event => event.type === 'local-ai-agent:chatgpt-answer')?.detail,
+  'Hello world'
+);
+
+console.log('DeepSeek, Z.ai, and ChatGPT stream regressions: PASS');

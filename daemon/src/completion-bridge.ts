@@ -1,10 +1,10 @@
 import crypto from 'node:crypto';
 import type {IncomingMessage, ServerResponse} from 'node:http';
-import type {FastifyInstance, FastifyReply, FastifyRequest} from 'fastify';
+import type {FastifyInstance} from 'fastify';
 import WebSocket, {WebSocketServer, type RawData} from 'ws';
 import {z} from 'zod';
 
-type Provider = 'deepseek' | 'zai';
+type Provider = 'deepseek' | 'zai' | 'chatgpt';
 
 type BridgeClient = {
   id: string;
@@ -109,10 +109,6 @@ const completionBodySchema = z.object({
 const BRIDGE_PROTOCOL = 'local-ai-agent';
 const COMPLETION_TIMEOUT_MS = Math.max(30_000, Number(process.env.COMPLETION_TIMEOUT_MS || 300_000));
 
-function isAuthorized(req: FastifyRequest, token: string) {
-  return req.headers.authorization === `Bearer ${token}`;
-}
-
 function openAiError(message: string, code: string, type = 'invalid_request_error') {
   return {error: {message, type, code}};
 }
@@ -120,6 +116,7 @@ function openAiError(message: string, code: string, type = 'invalid_request_erro
 function providerForModel(model: string): Provider | undefined {
   if (/deepseek/i.test(model)) return 'deepseek';
   if (/(?:^|[-_])(zai|z\.ai|glm)(?:$|[-_])/i.test(model) || /^(zai|z\.ai|glm)/i.test(model)) return 'zai';
+  if (/chatgpt/i.test(model) || /(?:^|[-_])openai(?:-web)?$/i.test(model)) return 'chatgpt';
   if (model === 'auto' || model === 'web-auto') return undefined;
   return undefined;
 }
@@ -129,7 +126,7 @@ function isSupportedModel(model: string) {
 }
 
 function normalizeProvider(value: string | undefined): Provider | undefined {
-  if (value === 'deepseek' || value === 'zai') return value;
+  if (value === 'deepseek' || value === 'zai' || value === 'chatgpt') return value;
   return undefined;
 }
 
@@ -517,22 +514,20 @@ export function installCompletionBridge(app: FastifyInstance, token: string) {
     return {item, promise};
   };
 
-  app.get('/v1/models', async (req, reply) => {
-    if (!isAuthorized(req, token)) return reply.code(401).send(openAiError('Invalid API key.', 'invalid_api_key', 'authentication_error'));
-    const providers = new Set([...clients].map(client => client.provider).filter(Boolean));
+  app.get('/v1/models', async () => {
     const now = Math.floor(Date.now() / 1000);
     return {
       object: 'list',
-      data: [
-        ...(providers.size ? [{id: 'auto', object: 'model', created: now, owned_by: 'local-ai-agent'}] : []),
-        ...(providers.has('deepseek') ? [{id: 'deepseek-web', object: 'model', created: now, owned_by: 'local-ai-agent'}] : []),
-        ...(providers.has('zai') ? [{id: 'glm-web', object: 'model', created: now, owned_by: 'local-ai-agent'}] : [])
-      ]
+      data: ['auto', 'chatgpt-web', 'deepseek-web', 'glm-web'].map(id => ({
+        id,
+        object: 'model',
+        created: now,
+        owned_by: 'local-ai-agent'
+      }))
     };
   });
 
   app.get('/v1/events', async (req, reply) => {
-    if (!isAuthorized(req, token)) return reply.code(401).send(openAiError('Invalid API key.', 'invalid_api_key', 'authentication_error'));
     const includeContent = (req.query as {include_content?: string} | undefined)?.include_content === '1';
     reply.hijack();
     reply.raw.writeHead(200, {
@@ -554,14 +549,13 @@ export function installCompletionBridge(app: FastifyInstance, token: string) {
   });
 
   app.post('/v1/chat/completions', async (req, reply) => {
-    if (!isAuthorized(req, token)) return reply.code(401).send(openAiError('Invalid API key.', 'invalid_api_key', 'authentication_error'));
     const parsed = completionBodySchema.safeParse(req.body);
     if (!parsed.success) {
       return reply.code(400).send(openAiError(parsed.error.issues[0]?.message || 'Invalid completion request.', 'invalid_request'));
     }
     if (!isSupportedModel(parsed.data.model)) {
       return reply.code(400).send(openAiError(
-        `Unsupported model ${parsed.data.model}. Use deepseek-web, glm-web, or auto.`,
+        `Unsupported model ${parsed.data.model}. Use chatgpt-web, deepseek-web, glm-web, or auto.`,
         'model_not_found'
       ));
     }

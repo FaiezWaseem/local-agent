@@ -19,6 +19,8 @@ installRequestLogging(app);
 await app.register(cors, {
   origin: [
     /^chrome-extension:\/\//,
+    'https://chatgpt.com',
+    'https://chat.openai.com',
     'https://chat.deepseek.com',
     'https://chat.qwen.ai',
     'https://chat.z.ai'
@@ -30,7 +32,7 @@ app.addHook('onSend', async (req, rep, payload) => {
   const origin = String(req.headers.origin || '');
   if (
     origin
-    && ['https://chat.deepseek.com', 'https://chat.qwen.ai', 'https://chat.z.ai'].includes(origin)
+    && ['https://chatgpt.com', 'https://chat.openai.com', 'https://chat.deepseek.com', 'https://chat.qwen.ai', 'https://chat.z.ai'].includes(origin)
     && req.headers['access-control-request-private-network'] === 'true'
   ) {
     rep.header('Access-Control-Allow-Private-Network', 'true');
@@ -131,6 +133,13 @@ app.post('/tool', async (req: any, rep) => {
   }
 });
 
-app.listen({host: '127.0.0.1', port: Number(process.env.PORT || 43121)}).then(() => {
-  console.log(`\nLocal AI Agent ready\nWorkspace: ${workspace}\nPairing token: ${TOKEN}\n`);
+const host = '127.0.0.1';
+const port = Number(process.env.PORT || 43121);
+app.listen({host, port}).then(() => {
+  console.log(
+    `\nLocal AI Agent ready\n` +
+    `Workspace: ${workspace}\n` +
+    `Pairing token: ${TOKEN}\n` +
+    `OpenAI-compatible endpoint: http://${host}:${port}/v1\n`
+  );
 });

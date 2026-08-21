@@ -15,6 +15,7 @@ export default defineConfig({
         content: resolve(rootDir, 'src/content.ts'),
         'deepseek-stream': resolve(rootDir, 'src/deepseek-stream.ts'),
         'zai-stream': resolve(rootDir, 'src/zai-stream.ts'),
+        'chatgpt-stream': resolve(rootDir, 'src/chatgpt-stream.ts'),
         popup: resolve(rootDir, 'popup.html'),
         sidepanel: resolve(rootDir, 'sidepanel.html')
       },

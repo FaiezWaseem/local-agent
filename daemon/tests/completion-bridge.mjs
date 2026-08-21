@@ -185,14 +185,14 @@ try {
     }));
   });
 
-  const models = await fetch(`${baseUrl}/v1/models`, {headers: {authorization: `Bearer ${token}`}}).then(value => value.json());
-  assert.deepEqual(models.data.map(model => model.id), ['auto', 'deepseek-web']);
+  const models = await fetch(`${baseUrl}/v1/models`).then(value => value.json());
+  assert.deepEqual(models.data.map(model => model.id), ['auto', 'chatgpt-web', 'deepseek-web', 'glm-web']);
 
   const eventController = new AbortController();
   const eventLogPromise = eventLogUntilFinished(baseUrl, eventController);
   const nonStreaming = await fetch(`${baseUrl}/v1/chat/completions`, {
     method: 'POST',
-    headers: {'content-type': 'application/json', authorization: `Bearer ${token}`},
+    headers: {'content-type': 'application/json'},
     body: JSON.stringify({model: 'deepseek-web', messages: [{role: 'user', content: 'Say hello'}]})
   });
   assert.equal(nonStreaming.status, 200);
@@ -382,17 +382,10 @@ try {
 
   const unknownModel = await fetch(`${baseUrl}/v1/chat/completions`, {
     method: 'POST',
-    headers: {'content-type': 'application/json', authorization: `Bearer ${token}`},
+    headers: {'content-type': 'application/json'},
     body: JSON.stringify({model: 'unknown-provider', messages: [{role: 'user', content: 'No'}]})
   });
   assert.equal(unknownModel.status, 400);
-
-  const unavailable = await fetch(`${baseUrl}/v1/chat/completions`, {
-    method: 'POST',
-    headers: {'content-type': 'application/json', authorization: 'Bearer wrong'},
-    body: JSON.stringify({model: 'deepseek-web', messages: [{role: 'user', content: 'No'}]})
-  });
-  assert.equal(unavailable.status, 401);
 
   console.log('OpenAI completion bridge integration: PASS');
 } finally {

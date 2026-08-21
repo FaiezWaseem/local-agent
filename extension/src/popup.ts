@@ -20,9 +20,17 @@ type ApprovalSettings = {
 type StatusTone = 'neutral' | 'busy' | 'success' | 'error';
 
 const CHAT_PROVIDERS: Record<string, string> = {
+  'chatgpt.com': 'ChatGPT',
+  'chat.openai.com': 'ChatGPT',
   'chat.deepseek.com': 'DeepSeek',
   'chat.qwen.ai': 'Qwen',
   'chat.z.ai': 'Z.ai'
+};
+const STREAM_SCRIPTS: Record<string, string> = {
+  'chatgpt.com': 'chatgpt-stream.js',
+  'chat.openai.com': 'chatgpt-stream.js',
+  'chat.deepseek.com': 'deepseek-stream.js',
+  'chat.z.ai': 'zai-stream.js'
 };
 const DEFAULT_SUBMISSION_DELAY_MS = 8000;
 const SUBMISSION_DELAY_OPTIONS = new Set([5000, 8000, 12000, 20000, 30000]);
@@ -240,11 +248,20 @@ async function call(url: string, body?: unknown) {
 async function attachToActiveTab() {
   const [tab] = await chrome.tabs.query({active: true, currentWindow: true});
   if (!tab?.id) {
-    throw new Error('Open DeepSeek, Qwen, or Z.ai in this window first.');
+    throw new Error('Open ChatGPT, DeepSeek, Qwen, or Z.ai in this window first.');
   }
   const provider = providerForUrl(tab.url);
   if (!provider) {
     throw new Error('The active tab is not a supported AI chat.');
+  }
+
+  const streamFile = STREAM_SCRIPTS[provider.url.hostname];
+  if (streamFile) {
+    await chrome.scripting.executeScript({
+      target: {tabId: tab.id},
+      files: [streamFile],
+      world: 'MAIN'
+    });
   }
 
   await chrome.scripting.executeScript({

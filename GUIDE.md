@@ -1,4 +1,6 @@
-DeepSeek Local Agent Guide
+Local AI Agent Guide
+
+Supported chats: ChatGPT, DeepSeek, Qwen, Z.ai
 
 Quick Start
 1. Clone repo
